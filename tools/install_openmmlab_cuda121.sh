@@ -139,6 +139,8 @@ echo "Installing current MMPose repo in editable mode..."
 cd "${REPO_ROOT}"
 python -m pip install -e . --no-deps
 
+python -m pip install --force-reinstall "numpy==${NUMPY_VERSION}"
+
 echo "Verifying imports..."
 python -c "import numpy, setuptools, torch, mmcv, mmengine, mmdet, mmpose; print('numpy=' + numpy.__version__); print('setuptools=' + setuptools.__version__); print('torch=' + torch.__version__); print('cuda=' + str(torch.version.cuda)); print('gpu=' + str(torch.cuda.is_available())); print('mmcv=' + mmcv.__version__); print('mmengine=' + mmengine.__version__); print('mmdet=' + mmdet.__version__); print('mmpose=' + mmpose.__version__)"
 

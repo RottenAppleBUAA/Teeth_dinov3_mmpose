@@ -1,1 +1,3 @@
 requests
+safetensors
+transformers>=4.56

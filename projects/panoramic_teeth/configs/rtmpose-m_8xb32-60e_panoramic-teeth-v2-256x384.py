@@ -1,4 +1,4 @@
-﻿custom_imports = dict(
+custom_imports = dict(
     imports=['projects.panoramic_teeth'], allow_failed_imports=False)
 
 _base_ = ['../../../configs/_base_/default_runtime.py']

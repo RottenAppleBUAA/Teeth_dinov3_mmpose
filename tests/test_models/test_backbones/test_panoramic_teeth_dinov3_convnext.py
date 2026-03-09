@@ -65,17 +65,35 @@ class _FakeHFModel(nn.Module):
         return SimpleNamespace(hidden_states=hidden_states)
 
 
-def _patch_transformers(monkeypatch):
+def _patch_transformers(monkeypatch, recorder=None):
     import transformers
+
+    def _config_from_pretrained(cls, pretrained, local_files_only=True):
+        if recorder is not None:
+            recorder.append(
+                ('config', pretrained, dict(local_files_only=local_files_only)))
+        return SimpleNamespace(hidden_sizes=[96, 192, 384, 768])
+
+    def _model_from_pretrained(cls,
+                               pretrained,
+                               local_files_only=True,
+                               trust_remote_code=False):
+        if recorder is not None:
+            recorder.append(
+                ('model', pretrained,
+                 dict(
+                     local_files_only=local_files_only,
+                     trust_remote_code=trust_remote_code)))
+        return _FakeHFModel()
 
     monkeypatch.setattr(
         transformers.AutoConfig,
         'from_pretrained',
-        classmethod(lambda cls, pretrained, local_files_only=True: SimpleNamespace(hidden_sizes=[96, 192, 384, 768])))
+        classmethod(_config_from_pretrained))
     monkeypatch.setattr(
         transformers.AutoModel,
         'from_pretrained',
-        classmethod(lambda cls, pretrained, local_files_only=True, trust_remote_code=False: _FakeHFModel()))
+        classmethod(_model_from_pretrained))
 
 
 def _make_fake_checkpoint_dir(tmp_path):
@@ -124,3 +142,33 @@ def test_dinov3_backbone_unfreezes_only_last_stage(monkeypatch, tmp_path):
     assert stage_flags['layer_norm.bias']
     assert not stage_flags['stages.2.0.weight']
     assert not stage_flags['stages.2.0.bias']
+
+
+def test_dinov3_backbone_requires_complete_local_checkpoint(tmp_path):
+    checkpoint_dir = tmp_path / 'dinov3-convnext-small-pretrain-lvd1689m'
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / 'config.json').write_text('{}', encoding='utf-8')
+
+    from projects.panoramic_teeth.models import DINOv3ConvNextBackbone
+
+    with pytest.raises(FileNotFoundError, match='model.safetensors'):
+        DINOv3ConvNextBackbone(pretrained=str(checkpoint_dir))
+
+
+def test_dinov3_backbone_uses_local_files_only(monkeypatch, tmp_path):
+    recorder = []
+    _patch_transformers(monkeypatch, recorder=recorder)
+    checkpoint_dir = _make_fake_checkpoint_dir(tmp_path)
+
+    from projects.panoramic_teeth.models import DINOv3ConvNextBackbone
+
+    DINOv3ConvNextBackbone(pretrained=str(checkpoint_dir))
+
+    assert recorder == [
+        ('config', str(checkpoint_dir), dict(local_files_only=True)),
+        (
+            'model',
+            str(checkpoint_dir),
+            dict(local_files_only=True, trust_remote_code=False),
+        ),
+    ]

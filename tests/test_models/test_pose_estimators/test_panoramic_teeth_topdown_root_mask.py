@@ -45,6 +45,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mmengine.config import Config
+from mmengine.runner.checkpoint import load_checkpoint
 from mmengine.structures import PixelData
 
 from mmpose.structures import PoseDataSample
@@ -105,12 +106,26 @@ def _make_packed_inputs(batch_size=2):
         with_heatmap=False,
         with_reg_label=False,
         with_simcc_label=True)
-    for sample in packed_inputs:
-        sample['data_samples'].gt_fields = PixelData(
+    for data_sample in packed_inputs['data_samples']:
+        data_sample.gt_fields = PixelData(
             root_mask=torch.ones(1, 384, 256, dtype=torch.float32))
-        sample['data_samples'].set_metainfo(
+        data_sample.set_metainfo(
             dict(flip_indices=[0, 1, 2, 3, 4], dataset_name='panoramic_teeth'))
     return packed_inputs
+
+
+def _run_single_train_step(model, packed_inputs):
+    model.train()
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=1e-3)
+    optimizer.zero_grad()
+    data = model.data_preprocessor(packed_inputs, training=True)
+    losses = model.forward(**data, mode='loss')
+    total_loss = sum(losses.values())
+    total_loss.backward()
+    optimizer.step()
+    return losses
 
 
 def test_stage1_dinov3_config_builds_and_runs(monkeypatch, tmp_path):
@@ -167,3 +182,54 @@ def test_stage2_dinov3_config_resolves_stage1_best_checkpoint(monkeypatch,
 
     assert cfg.load_from.replace('\\', '/').endswith('best_NME_epoch_17.pth')
     assert cfg.model.backbone.trainable_stages == (3, )
+
+
+def test_stage1_and_stage2_dinov3_train_smoke(monkeypatch, tmp_path):
+    _patch_transformers(monkeypatch)
+    checkpoint_dir = _make_fake_checkpoint_dir(tmp_path)
+
+    register_all_modules()
+    importlib.import_module('projects.panoramic_teeth')
+
+    config_dir = ROOT / 'projects' / 'panoramic_teeth' / 'configs'
+    stage1_config_path = config_dir / (
+        'rtmpose-dinov3-convnext-s_8xb32-60e_'
+        'panoramic-teeth-v2-256x384_stage1.py')
+    stage2_config_path = config_dir / (
+        'rtmpose-dinov3-convnext-s_8xb32-20e_'
+        'panoramic-teeth-v2-256x384_stage2.py')
+
+    from mmpose.models import build_pose_estimator
+
+    stage1_cfg = Config.fromfile(str(stage1_config_path))
+    stage1_cfg.model.backbone.pretrained = str(checkpoint_dir)
+    stage1_cfg.model.test_cfg.flip_test = False
+    stage1_model = build_pose_estimator(stage1_cfg.model)
+
+    packed_inputs = _make_packed_inputs(batch_size=2)
+    stage1_losses = _run_single_train_step(stage1_model, packed_inputs)
+    assert 'loss_kpt' in stage1_losses
+    assert 'loss_mask_bce' in stage1_losses
+    assert 'loss_mask_dice' in stage1_losses
+
+    stage1_dir = (
+        tmp_path / 'work_dirs' /
+        'rtmpose-dinov3-convnext-s_8xb32-60e_panoramic-teeth-v2-256x384_stage1')
+    stage1_dir.mkdir(parents=True)
+    stage1_ckpt = stage1_dir / 'best_NME_epoch_1.pth'
+    torch.save({'state_dict': stage1_model.state_dict()}, stage1_ckpt)
+
+    monkeypatch.chdir(tmp_path)
+
+    stage2_cfg = Config.fromfile(str(stage2_config_path))
+    stage2_cfg.model.backbone.pretrained = str(checkpoint_dir)
+    stage2_cfg.model.test_cfg.flip_test = False
+    assert stage2_cfg.load_from is not None
+
+    stage2_model = build_pose_estimator(stage2_cfg.model)
+    load_checkpoint(stage2_model, stage2_cfg.load_from, map_location='cpu')
+
+    stage2_losses = _run_single_train_step(stage2_model, packed_inputs)
+    assert 'loss_kpt' in stage2_losses
+    assert 'loss_mask_bce' in stage2_losses
+    assert 'loss_mask_dice' in stage2_losses

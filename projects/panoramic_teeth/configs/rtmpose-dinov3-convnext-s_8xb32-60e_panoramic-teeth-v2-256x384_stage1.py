@@ -9,6 +9,7 @@ work_dir = (
 
 model = dict(
     backbone=dict(
+        _delete_=True,
         type='DINOv3ConvNextBackbone',
         pretrained=pretrained,
         out_indices=(3, ),

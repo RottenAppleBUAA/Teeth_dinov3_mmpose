@@ -133,4 +133,4 @@ docs/**/modelzoo.md
 
 *.DS_Store
 
-datasets/
+/datasets/

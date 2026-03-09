@@ -1,4 +1,35 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+def _patch_torch_pytree_compat():
+    try:
+        import torch.utils._pytree as torch_pytree
+    except Exception:
+        return
+
+    if hasattr(torch_pytree, 'register_pytree_node'):
+        return
+    if not hasattr(torch_pytree, '_register_pytree_node'):
+        return
+
+    def _compat_register_pytree_node(typ,
+                                     flatten_fn,
+                                     unflatten_fn,
+                                     *,
+                                     serialized_type_name=None,
+                                     to_dumpable_context=None,
+                                     from_dumpable_context=None):
+        del serialized_type_name
+        return torch_pytree._register_pytree_node(
+            typ,
+            flatten_fn,
+            unflatten_fn,
+            to_dumpable_context=to_dumpable_context,
+            from_dumpable_context=from_dumpable_context)
+
+    torch_pytree.register_pytree_node = _compat_register_pytree_node
+
+
+_patch_torch_pytree_compat()
+
 import mmcv
 import mmengine
 from mmengine.utils import digit_version

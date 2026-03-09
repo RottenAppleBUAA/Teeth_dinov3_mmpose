@@ -1,7 +1,7 @@
 _base_ = ['./rtmpose-m_8xb32-60e_panoramic-teeth-v2-256x384.py']
 
 pretrained = (
-    'E:/CodeSpace/mmpose/dinov3_weights/'
+    '{{ fileDirname }}/../../../dinov3_weights/'
     'dinov3-convnext-small-pretrain-lvd1689m')
 work_dir = (
     './work_dirs/'

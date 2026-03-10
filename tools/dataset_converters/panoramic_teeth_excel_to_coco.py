@@ -31,6 +31,8 @@ class RawEntry:
     tooth_id: Optional[int]
     side_token: Optional[str]
     kind: str
+    tooth_id_from_label: bool
+    side_from_label: bool
     raw_points: List[Tuple[float, float]]
     label: str
     row_index: int
@@ -190,7 +192,7 @@ def resolve_source_canvas_width(image_width: int,
                                 source_canvas_height: int) -> int:
     if source_canvas_width is not None:
         return source_canvas_width
-    return max(1, int(image_width * source_canvas_height / float(image_height)))
+    return max(1, round(image_width * source_canvas_height / float(image_height)))
 
 
 def scale_points_to_image(points: Sequence[Tuple[float, float]],
@@ -346,6 +348,8 @@ def parse_measurement_entries(text: str,
             continue
 
         tooth_id, side_token, kind = parse_label(label_part)
+        tooth_id_from_label = tooth_id is not None
+        side_from_label = side_token is not None
         if tooth_id is None:
             tooth_id = fallback_tooth_id
 
@@ -354,6 +358,8 @@ def parse_measurement_entries(text: str,
                 tooth_id=tooth_id,
                 side_token=side_token,
                 kind=kind,
+                tooth_id_from_label=tooth_id_from_label,
+                side_from_label=side_from_label,
                 raw_points=raw_points,
                 label=normalize_label(label_part),
                 row_index=row_index,

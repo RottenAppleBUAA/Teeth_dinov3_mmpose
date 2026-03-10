@@ -43,26 +43,30 @@ def build_closed_polygon(mesial_points: Sequence[Point2D],
     return list(mesial_points) + list(reversed(distal_points))
 
 
-def repair_polygon(points: Sequence[Point2D]) -> Optional[Polygon]:
+def repair_polygon(points: Sequence[Point2D]) -> Tuple[Optional[Polygon], Optional[str]]:
     if len(points) < 4:
-        return None
+        return None, 'invalid_polygon'
 
     polygon = Polygon(points)
     if polygon.is_empty:
-        return None
+        return None, 'invalid_polygon'
     if not polygon.is_valid:
         polygon = make_valid(polygon)
     if polygon.is_empty:
-        return None
+        return None, 'invalid_polygon'
     if polygon.geom_type == 'MultiPolygon':
-        polygon = max(polygon.geoms, key=lambda geom: geom.area)
+        return None, 'ambiguous_repaired_polygon'
     if polygon.geom_type != 'Polygon':
-        return None
+        return None, 'invalid_polygon'
     if not polygon.is_valid:
         polygon = polygon.buffer(0)
-    if polygon.is_empty or polygon.geom_type != 'Polygon':
-        return None
-    return polygon
+    if polygon.is_empty:
+        return None, 'invalid_polygon'
+    if polygon.geom_type == 'MultiPolygon':
+        return None, 'ambiguous_repaired_polygon'
+    if polygon.geom_type != 'Polygon':
+        return None, 'invalid_polygon'
+    return polygon, None
 
 
 def snap_point_to_boundary(point: Point2D, polygon: Polygon) -> Point2D:
@@ -124,6 +128,7 @@ def build_tooth_instance(
     image_height: int,
     apex_merge_threshold: float = 4.0,
     min_area: float = 16.0,
+    min_side_points: int = 4,
 ) -> Tuple[Optional[dict], Dict[str, object]]:
     debug: Dict[str, object] = {
         'tooth_id': tooth_id,
@@ -137,11 +142,14 @@ def build_tooth_instance(
     if len(m_points) < 2 or len(d_points) < 2:
         debug['skip_reason'] = 'too_few_points'
         return None, debug
+    if len(m_points) < min_side_points or len(d_points) < min_side_points:
+        debug['skip_reason'] = 'incomplete_side_contour'
+        return None, debug
 
     raw_polygon_points = build_closed_polygon(m_points, d_points)
-    polygon = repair_polygon(raw_polygon_points)
+    polygon, repair_reason = repair_polygon(raw_polygon_points)
     if polygon is None:
-        debug['skip_reason'] = 'invalid_polygon'
+        debug['skip_reason'] = repair_reason or 'invalid_polygon'
         return None, debug
     if polygon.area < min_area:
         debug['skip_reason'] = 'polygon_area_too_small'

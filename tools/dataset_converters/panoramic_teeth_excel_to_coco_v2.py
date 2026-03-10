@@ -7,8 +7,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
-
+from typing import Dict, List, Optional, Sequence
 from PIL import Image, ImageDraw
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -51,8 +50,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--traced-subdir', type=Path, default=None)
     parser.add_argument('--source-canvas-width', type=int, default=None)
     parser.add_argument('--source-canvas-height', type=int, default=512)
-    parser.add_argument('--point-offset-x', type=float, default=0.0)
-    parser.add_argument('--point-offset-y', type=float, default=0.0)
+    parser.add_argument(
+        '--point-offset-x',
+        type=float,
+        default=None,
+        help='Explicit global x offset applied after scaling. When omitted, '
+        'v2 export estimates it from traced images.')
+    parser.add_argument(
+        '--point-offset-y',
+        type=float,
+        default=None,
+        help='Explicit global y offset applied after scaling. When omitted, '
+        'v2 export estimates it from traced images.')
+    parser.add_argument(
+        '--quality-report-json',
+        type=Path,
+        default=None,
+        help='Optional sample_metrics.json from the annotation quality report. '
+        'Used together with --min-match-ratio to filter samples.')
+    parser.add_argument(
+        '--min-match-ratio',
+        type=float,
+        default=None,
+        help='Keep only samples whose quality-report match_ratio is greater '
+        'than or equal to this threshold.')
+    parser.add_argument(
+        '--sample-list-json',
+        type=Path,
+        default=None,
+        help='Optional JSON file containing sample ids to keep. Supports '
+        '{"sample_ids": [...]} or {"samples": [{"sample_id": ...}, ...]}.')
     return parser.parse_args()
 
 
@@ -107,8 +134,23 @@ def initial_summary(dataset_root: Path, excel_dir: Path, image_dir: Path,
         'traced_dir': str(traced_dir),
         'source_canvas_width': args.source_canvas_width,
         'source_canvas_height': args.source_canvas_height,
-        'point_offset_x': args.point_offset_x,
-        'point_offset_y': args.point_offset_y,
+        'quality_report_json': str(args.quality_report_json)
+        if args.quality_report_json else None,
+        'sample_list_json': str(args.sample_list_json)
+        if args.sample_list_json else None,
+        'min_match_ratio': args.min_match_ratio,
+        'num_samples_filtered_out_by_sample_list': 0,
+        'excluded_sample_ids_by_sample_list': [],
+        'num_samples_filtered_out_by_match_ratio': 0,
+        'excluded_sample_ids_by_match_ratio': [],
+        'point_offset_x': 0.0,
+        'point_offset_y': 0.0,
+        'estimated_point_offset_x': 0.0,
+        'estimated_point_offset_y': 0.0,
+        'alignment_median_px_before': 0.0,
+        'alignment_median_px_after': 0.0,
+        'alignment_matched_points_before': 0,
+        'alignment_matched_points_after': 0,
         'empty_row_after_parse': 0,
         'entry_with_invalid_tooth': 0,
         'unknown_label_format': 0,
@@ -120,14 +162,129 @@ def initial_summary(dataset_root: Path, excel_dir: Path, image_dir: Path,
         'unknown_side_single_fill': 0,
         'discarded_extra_side': 0,
         'multi_candidate_tooth': 0,
+        'ambiguous_tooth_label': 0,
+        'single_sided_unpaired_tooth': 0,
+        'invalid_tooth_number_pair': 0,
         'missing_required_side': 0,
         'too_few_points': 0,
+        'incomplete_side_contour': 0,
         'invalid_polygon': 0,
+        'ambiguous_repaired_polygon': 0,
         'polygon_area_too_small': 0,
         'polygon_vertices_too_few': 0,
         'snapped_keypoints': 0,
         'instances_written': 0,
     }
+
+
+def load_quality_filtered_sample_ids(
+    sample_ids: Sequence[int],
+    quality_report_json: Path,
+    min_match_ratio: float,
+) -> tuple[List[int], List[int]]:
+    with quality_report_json.open('r', encoding='utf-8') as file:
+        payload = json.load(file)
+
+    samples = payload.get('samples')
+    if not isinstance(samples, list):
+        raise ValueError(
+            f'Invalid quality report format: missing "samples" list in '
+            f'{quality_report_json}')
+
+    match_ratio_by_id: Dict[int, float] = {}
+    for item in samples:
+        sample_id = item.get('sample_id')
+        match_ratio = item.get('match_ratio')
+        if sample_id is None or match_ratio is None:
+            continue
+        match_ratio_by_id[int(sample_id)] = float(match_ratio)
+
+    kept_sample_ids: List[int] = []
+    excluded_sample_ids: List[int] = []
+    for sample_id in sample_ids:
+        match_ratio = match_ratio_by_id.get(sample_id)
+        if match_ratio is None or match_ratio < min_match_ratio:
+            excluded_sample_ids.append(sample_id)
+            continue
+        kept_sample_ids.append(sample_id)
+    return kept_sample_ids, excluded_sample_ids
+
+
+def load_sample_ids_from_json(sample_list_json: Path) -> List[int]:
+    with sample_list_json.open('r', encoding='utf-8') as file:
+        payload = json.load(file)
+
+    if isinstance(payload, dict):
+        if isinstance(payload.get('sample_ids'), list):
+            return sorted({int(sample_id) for sample_id in payload['sample_ids']})
+        if isinstance(payload.get('samples'), list):
+            sample_ids = []
+            for item in payload['samples']:
+                if not isinstance(item, dict) or 'sample_id' not in item:
+                    continue
+                sample_ids.append(int(item['sample_id']))
+            return sorted(set(sample_ids))
+    raise ValueError(
+        f'Invalid sample list format in {sample_list_json}. Expected '
+        '{"sample_ids": [...]} or {"samples": [{"sample_id": ...}, ...]}.')
+
+
+def has_explicit_tooth_and_side(entry: legacy.RawEntry) -> bool:
+    return (entry.tooth_id_from_label and entry.side_from_label
+            and entry.side_token in {'M', 'D', 'left', 'right'})
+
+
+def canonical_side_for_entry(tooth_id: int,
+                             entry: legacy.RawEntry) -> Optional[str]:
+    if entry.side_token in {'M', 'D'}:
+        return entry.side_token
+    if entry.side_token in {'left', 'right'}:
+        return legacy.image_side_to_md(tooth_id, entry.side_token)
+    return None
+
+
+def resolve_strict_pair_entries(
+    tooth_id: int,
+    entries: Sequence[legacy.RawEntry],
+    summary: dict,
+) -> Optional[Dict[str, legacy.RawEntry]]:
+    if not entries:
+        summary['single_sided_unpaired_tooth'] = (
+            summary.get('single_sided_unpaired_tooth', 0) + 1)
+        return None
+
+    if any(not has_explicit_tooth_and_side(entry) for entry in entries):
+        summary['ambiguous_tooth_label'] = (
+            summary.get('ambiguous_tooth_label', 0) + 1)
+        return None
+
+    grouped_entries: Dict[str, List[legacy.RawEntry]] = {'M': [], 'D': []}
+    for entry in entries:
+        if entry.tooth_id != tooth_id:
+            summary['invalid_tooth_number_pair'] = (
+                summary.get('invalid_tooth_number_pair', 0) + 1)
+            return None
+        canonical_side = canonical_side_for_entry(tooth_id, entry)
+        if canonical_side is None:
+            summary['ambiguous_tooth_label'] = (
+                summary.get('ambiguous_tooth_label', 0) + 1)
+            return None
+        grouped_entries[canonical_side].append(entry)
+
+    if not grouped_entries['M'] or not grouped_entries['D']:
+        summary['single_sided_unpaired_tooth'] = (
+            summary.get('single_sided_unpaired_tooth', 0) + 1)
+        return None
+
+    resolved = {
+        'M': legacy.choose_best(grouped_entries['M']),
+        'D': legacy.choose_best(grouped_entries['D']),
+    }
+    summary['discarded_extra_side'] = (
+        summary.get('discarded_extra_side', 0)
+        + max(0, len(grouped_entries['M']) - 1)
+        + max(0, len(grouped_entries['D']) - 1))
+    return resolved
 
 
 def export_visualizations(records: Dict[int, legacy.ImageRecord],
@@ -192,8 +349,9 @@ def export_visualizations(records: Dict[int, legacy.ImageRecord],
 
 def build_records(dataset_root: Path, excel_dir: Path, image_dir: Path,
                   traced_dir: Path, sample_ids: List[int],
-                  summary: dict,
-                  args: argparse.Namespace):
+                  summary: dict, source_canvas_width: Optional[int],
+                  source_canvas_height: int, point_offset_x: float,
+                  point_offset_y: float):
     excel_map = {
         legacy.extract_sample_id(path): path
         for path in sorted(excel_dir.glob('*.xlsx'))
@@ -217,10 +375,10 @@ def build_records(dataset_root: Path, excel_dir: Path, image_dir: Path,
             image_path=image_map[sample_id],
             traced_image_path=traced_map.get(sample_id),
             excel_path=excel_map[sample_id],
-            source_canvas_width=args.source_canvas_width,
-            source_canvas_height=args.source_canvas_height,
-            point_offset_x=args.point_offset_x,
-            point_offset_y=args.point_offset_y,
+            source_canvas_width=source_canvas_width,
+            source_canvas_height=source_canvas_height,
+            point_offset_x=point_offset_x,
+            point_offset_y=point_offset_y,
             summary=summary)
         records[sample_id] = record
         image_id_map[sample_id] = image_id
@@ -240,10 +398,9 @@ def build_annotations(records: Dict[int, legacy.ImageRecord],
     for sample_id, record in records.items():
         image_id = image_id_map[sample_id]
         for tooth_id in legacy.TARGET_TEETH:
-            resolved = legacy.resolve_entries_for_tooth(
+            resolved = resolve_strict_pair_entries(
                 tooth_id, record.side_entries.get(tooth_id, []), summary)
-            if 'M' not in resolved or 'D' not in resolved:
-                summary['missing_required_side'] += 1
+            if resolved is None:
                 continue
 
             annotation, debug = build_tooth_instance(
@@ -303,11 +460,49 @@ def main() -> None:
     summary = initial_summary(dataset_root, excel_dir, image_dir, traced_dir, args)
     summary['num_excels'] = len(excel_ids)
     summary['num_images'] = len(image_ids)
+    summary['num_samples_before_filtering'] = len(sample_ids)
+
+    if args.sample_list_json is not None:
+        allowed_sample_ids = set(load_sample_ids_from_json(args.sample_list_json))
+        excluded_sample_ids = [
+            sample_id for sample_id in sample_ids if sample_id not in allowed_sample_ids
+        ]
+        sample_ids = [sample_id for sample_id in sample_ids
+                      if sample_id in allowed_sample_ids]
+        summary['sample_list_json'] = str(args.sample_list_json)
+        summary['num_samples_filtered_out_by_sample_list'] = len(excluded_sample_ids)
+        summary['excluded_sample_ids_by_sample_list'] = excluded_sample_ids
+
+    if args.min_match_ratio is not None:
+        quality_report_json = (
+            args.quality_report_json or
+            dataset_root / 'annotation_quality_report' / 'sample_metrics.json')
+        kept_sample_ids, excluded_sample_ids = load_quality_filtered_sample_ids(
+            sample_ids, quality_report_json, args.min_match_ratio)
+        sample_ids = kept_sample_ids
+        summary['quality_report_json'] = str(quality_report_json)
+        summary['num_samples_filtered_out_by_match_ratio'] = len(
+            excluded_sample_ids)
+        summary['excluded_sample_ids_by_match_ratio'] = excluded_sample_ids
+
     summary['num_samples'] = len(sample_ids)
 
-    records, images, image_id_map = build_records(dataset_root, excel_dir,
-                                                  image_dir, traced_dir,
-                                                  sample_ids, summary, args)
+    initial_point_offset_x = float(args.point_offset_x or 0.0)
+    initial_point_offset_y = float(args.point_offset_y or 0.0)
+    records, images, image_id_map = build_records(
+        dataset_root,
+        excel_dir,
+        image_dir,
+        traced_dir,
+        sample_ids,
+        summary,
+        source_canvas_width=args.source_canvas_width,
+        source_canvas_height=args.source_canvas_height,
+        point_offset_x=initial_point_offset_x,
+        point_offset_y=initial_point_offset_y)
+    summary['point_offset_x'] = initial_point_offset_x
+    summary['point_offset_y'] = initial_point_offset_y
+
     annotations = build_annotations(records, image_id_map, summary)
     summary['num_annotations'] = len(annotations)
 

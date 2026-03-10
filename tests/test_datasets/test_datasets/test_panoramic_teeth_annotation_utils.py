@@ -18,8 +18,8 @@ def test_dedupe_consecutive_points_keeps_order():
 
 
 def test_build_tooth_instance_derives_keypoints_and_polygon():
-    mesial = [(10, 10), (10, 18), (12, 28)]
-    distal = [(26, 10), (26, 18), (24, 28)]
+    mesial = [(10, 10), (10, 18), (11, 24), (12, 28)]
+    distal = [(26, 10), (26, 18), (25, 24), (24, 28)]
 
     annotation, debug = build_tooth_instance(
         tooth_id=11,
@@ -48,3 +48,39 @@ def test_build_tooth_instance_derives_keypoints_and_polygon():
     assert bbox[1] <= 10.0
     assert bbox[2] > 0
     assert bbox[3] > 0
+
+
+def test_build_tooth_instance_rejects_incomplete_side_contour():
+    mesial = [(10, 10), (10, 18), (12, 28)]
+    distal = [(26, 10), (26, 18), (24, 24), (24, 28)]
+
+    annotation, debug = build_tooth_instance(
+        tooth_id=11,
+        mesial_points=mesial,
+        distal_points=distal,
+        image_id=0,
+        annotation_id=0,
+        image_width=100,
+        image_height=100,
+    )
+
+    assert annotation is None
+    assert debug['skip_reason'] == 'incomplete_side_contour'
+
+
+def test_build_tooth_instance_rejects_ambiguous_repaired_polygon():
+    mesial = [(0, 0), (0, 3), (3, 0), (3, 3)]
+    distal = [(6, 3), (6, 0), (3, 3), (3, 0)]
+
+    annotation, debug = build_tooth_instance(
+        tooth_id=36,
+        mesial_points=mesial,
+        distal_points=distal,
+        image_id=0,
+        annotation_id=0,
+        image_width=100,
+        image_height=100,
+    )
+
+    assert annotation is None
+    assert debug['skip_reason'] == 'ambiguous_repaired_polygon'

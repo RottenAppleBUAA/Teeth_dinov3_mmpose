@@ -12,29 +12,29 @@ stage1_work_dir = Path(
 work_dir = (
     './work_dirs/'
     'rtmpose-dinov3-convnext-s_8xb32-20e_panoramic-teeth-v2-256x384_stage2')
-
-
-def _resolve_stage1_best_checkpoint(stage1_dir: Path):
-    direct_best = stage1_dir / 'best_NME.pth'
-    if direct_best.is_file():
-        return direct_best
-
-    candidates = list(stage1_dir.glob('best_NME_epoch_*.pth'))
-    if not candidates:
-        return None
-
-    def _epoch_key(path: Path) -> int:
+_stage1_best_checkpoint = stage1_work_dir / 'best_NME.pth'
+if _stage1_best_checkpoint.is_file():
+    load_from = _stage1_best_checkpoint.as_posix()
+else:
+    load_from = None
+    for _candidate in stage1_work_dir.glob('best_NME_epoch_*.pth'):
         try:
-            return int(path.stem.rsplit('_', 1)[-1])
+            _candidate_epoch = int(_candidate.stem.rsplit('_', 1)[-1])
         except ValueError:
-            return -1
+            continue
+        if load_from is None or _candidate_epoch > _stage1_best_epoch:
+            load_from = _candidate.as_posix()
+            _stage1_best_epoch = _candidate_epoch
 
-    return max(candidates, key=_epoch_key)
-
-
-_stage1_best_checkpoint = _resolve_stage1_best_checkpoint(stage1_work_dir)
-load_from = (str(_stage1_best_checkpoint).replace('\\', '/')
-             if _stage1_best_checkpoint is not None else None)
+del Path
+del stage1_work_dir
+del _stage1_best_checkpoint
+if '_candidate' in locals():
+    del _candidate
+if '_candidate_epoch' in locals():
+    del _candidate_epoch
+if '_stage1_best_epoch' in locals():
+    del _stage1_best_epoch
 
 train_cfg = dict(max_epochs=max_epochs, val_interval=5)
 

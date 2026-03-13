@@ -3,11 +3,12 @@
 import argparse
 import json
 import random
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 from PIL import Image, ImageDraw
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -18,7 +19,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import panoramic_teeth_excel_to_coco as legacy  # noqa: E402
+import panoramic_teeth_converter_common as common  # noqa: E402
 from projects.panoramic_teeth.datasets.annotation_utils import build_tooth_instance  # noqa: E402
 
 
@@ -97,6 +98,163 @@ def json_default(value):
     if isinstance(value, Path):
         return str(value)
     raise TypeError(f'Object of type {type(value)!r} is not JSON serializable')
+
+
+def is_ignored_auxiliary_file(path: Path) -> bool:
+    name = path.name
+    return (name.startswith('.')
+            or name.startswith('~$')
+            or name.startswith('.~')
+            or ':Zone.Identifier' in name)
+
+
+def strip_excel_export_suffix(stem: str) -> str:
+    match = re.match(
+        r'^(?P<base>.+?\.(?:jpe?g|png|bmp|tif|tiff))_(?:\d{8})_(?:\d{6})$',
+        stem,
+        re.IGNORECASE)
+    if match:
+        return Path(match.group('base')).stem
+    return stem
+
+
+def derive_numeric_sample_token(path: Path) -> Optional[str]:
+    try:
+        return f'id:{common.extract_sample_id(path)}'
+    except ValueError:
+        return None
+
+
+def derive_name_sample_token(path: Path, source_kind: str) -> str:
+    stem = path.stem
+    if source_kind == 'excel':
+        stem = strip_excel_export_suffix(stem)
+    elif source_kind == 'traced' and stem.lower().endswith('_reserve'):
+        stem = stem[:-len('_reserve')]
+    return f'name:{stem.casefold()}'
+
+
+def collect_source_files(
+    source_dir: Path,
+    source_kind: str,
+    required_suffixes: Tuple[str, ...],
+    token_mode: str,
+) -> Dict[str, Path]:
+    token_map: Dict[str, Path] = {}
+    for path in sorted(source_dir.glob('*')):
+        if not path.is_file() or is_ignored_auxiliary_file(path):
+            continue
+        if required_suffixes and path.suffix.lower() not in required_suffixes:
+            continue
+        if token_mode == 'numeric':
+            token = derive_numeric_sample_token(path)
+        elif token_mode == 'name':
+            token = derive_name_sample_token(path, source_kind)
+        else:
+            raise ValueError(f'Unsupported token mode: {token_mode}')
+        if token is not None:
+            token_map[token] = path
+    return token_map
+
+
+def collect_source_maps(excel_dir: Path, image_dir: Path, traced_dir: Path,
+                        token_mode: str) -> Tuple[Dict[str, Path], Dict[str, Path],
+                                                  Dict[str, Path]]:
+    excel_map = collect_source_files(excel_dir, 'excel', ('.xlsx',), token_mode)
+    image_map = collect_source_files(
+        image_dir, 'image',
+        ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'), token_mode)
+    traced_map = collect_source_files(
+        traced_dir, 'traced',
+        ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'), token_mode)
+    return excel_map, image_map, traced_map
+
+
+def count_valid_source_files(source_dir: Path,
+                             required_suffixes: Tuple[str, ...]) -> int:
+    count = 0
+    for path in sorted(source_dir.glob('*')):
+        if not path.is_file() or is_ignored_auxiliary_file(path):
+            continue
+        if required_suffixes and path.suffix.lower() not in required_suffixes:
+            continue
+        count += 1
+    return count
+
+
+def select_sample_sources(
+    excel_dir: Path,
+    image_dir: Path,
+    traced_dir: Path,
+    require_traced: bool = False,
+) -> Tuple[Dict[str, Path], Dict[str, Path], Dict[str, Path], List[str], dict]:
+    numeric_excel_map, numeric_image_map, numeric_traced_map = collect_source_maps(
+        excel_dir, image_dir, traced_dir, 'numeric')
+    name_excel_map, name_image_map, name_traced_map = collect_source_maps(
+        excel_dir, image_dir, traced_dir, 'name')
+
+    maps_by_mode = {
+        'numeric': {
+            'excel': numeric_excel_map,
+            'image': numeric_image_map,
+            'traced': numeric_traced_map,
+        },
+        'name': {
+            'excel': name_excel_map,
+            'image': name_image_map,
+            'traced': name_traced_map,
+        },
+    }
+    numeric_common_keys = set(numeric_excel_map) & set(numeric_image_map)
+    name_common_keys = set(name_excel_map) & set(name_image_map)
+    if require_traced:
+        numeric_common_keys &= set(numeric_traced_map)
+        name_common_keys &= set(name_traced_map)
+
+    merged_excel_map: Dict[str, Path] = {}
+    merged_image_map: Dict[str, Path] = {}
+    merged_traced_map: Dict[str, Path] = {}
+    selected_keys: List[str] = []
+    seen_source_triplets = set()
+    mode_usage = {'numeric': 0, 'name': 0}
+
+    for mode_name, common_keys in (
+            ('numeric', sorted(numeric_common_keys)),
+            ('name', sorted(name_common_keys))):
+        mode_maps = maps_by_mode[mode_name]
+        for sample_key in common_keys:
+            traced_path = mode_maps['traced'].get(sample_key)
+            source_triplet = (
+                mode_maps['excel'][sample_key],
+                mode_maps['image'][sample_key],
+                traced_path,
+            )
+            if source_triplet in seen_source_triplets:
+                continue
+            seen_source_triplets.add(source_triplet)
+            selected_keys.append(sample_key)
+            merged_excel_map[sample_key] = mode_maps['excel'][sample_key]
+            merged_image_map[sample_key] = mode_maps['image'][sample_key]
+            if traced_path is not None:
+                merged_traced_map[sample_key] = traced_path
+            mode_usage[mode_name] += 1
+
+    stats = {
+        'num_valid_excels': count_valid_source_files(excel_dir, ('.xlsx',)),
+        'num_valid_images': count_valid_source_files(
+            image_dir, ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')),
+        'num_valid_traced_images': count_valid_source_files(
+            traced_dir, ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')),
+        'num_common_samples_numeric_mode': len(numeric_common_keys),
+        'num_common_samples_name_mode': len(name_common_keys),
+        'num_selected_samples_numeric_mode': mode_usage['numeric'],
+        'num_selected_samples_name_mode': mode_usage['name'],
+        'sample_key_mode': (
+            'mixed'
+            if mode_usage['numeric'] > 0 and mode_usage['name'] > 0
+            else ('numeric_id' if mode_usage['numeric'] > 0 else 'file_stem')),
+    }
+    return merged_excel_map, merged_image_map, merged_traced_map, selected_keys, stats
 
 
 def build_dataset_payload(images: List[dict], annotations: List[dict],
@@ -229,25 +387,25 @@ def load_sample_ids_from_json(sample_list_json: Path) -> List[int]:
         '{"sample_ids": [...]} or {"samples": [{"sample_id": ...}, ...]}.')
 
 
-def has_explicit_tooth_and_side(entry: legacy.RawEntry) -> bool:
+def has_explicit_tooth_and_side(entry: common.RawEntry) -> bool:
     return (entry.tooth_id_from_label and entry.side_from_label
             and entry.side_token in {'M', 'D', 'left', 'right'})
 
 
 def canonical_side_for_entry(tooth_id: int,
-                             entry: legacy.RawEntry) -> Optional[str]:
+                             entry: common.RawEntry) -> Optional[str]:
     if entry.side_token in {'M', 'D'}:
         return entry.side_token
     if entry.side_token in {'left', 'right'}:
-        return legacy.image_side_to_md(tooth_id, entry.side_token)
+        return common.image_side_to_md(tooth_id, entry.side_token)
     return None
 
 
 def resolve_strict_pair_entries(
     tooth_id: int,
-    entries: Sequence[legacy.RawEntry],
+    entries: Sequence[common.RawEntry],
     summary: dict,
-) -> Optional[Dict[str, legacy.RawEntry]]:
+) -> Optional[Dict[str, common.RawEntry]]:
     if not entries:
         summary['single_sided_unpaired_tooth'] = (
             summary.get('single_sided_unpaired_tooth', 0) + 1)
@@ -258,7 +416,7 @@ def resolve_strict_pair_entries(
             summary.get('ambiguous_tooth_label', 0) + 1)
         return None
 
-    grouped_entries: Dict[str, List[legacy.RawEntry]] = {'M': [], 'D': []}
+    grouped_entries: Dict[str, List[common.RawEntry]] = {'M': [], 'D': []}
     for entry in entries:
         if entry.tooth_id != tooth_id:
             summary['invalid_tooth_number_pair'] = (
@@ -277,8 +435,8 @@ def resolve_strict_pair_entries(
         return None
 
     resolved = {
-        'M': legacy.choose_best(grouped_entries['M']),
-        'D': legacy.choose_best(grouped_entries['D']),
+        'M': common.choose_best(grouped_entries['M']),
+        'D': common.choose_best(grouped_entries['D']),
     }
     summary['discarded_extra_side'] = (
         summary.get('discarded_extra_side', 0)
@@ -287,13 +445,16 @@ def resolve_strict_pair_entries(
     return resolved
 
 
-def export_visualizations(records: Dict[int, legacy.ImageRecord],
+def export_visualizations(records: Dict[int, common.ImageRecord],
                           image_id_map: Dict[int, int],
                           annotations: List[dict],
                           output_dir: Path,
                           count: int,
                           seed: int) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    for stale_file in output_dir.glob('overlay_*.jpg'):
+        if stale_file.is_file():
+            stale_file.unlink()
     ann_by_image = defaultdict(list)
     for annotation in annotations:
         ann_by_image[annotation['image_id']].append(annotation)
@@ -347,34 +508,23 @@ def export_visualizations(records: Dict[int, legacy.ImageRecord],
         output.save(output_dir / f'overlay_{sample_id}.jpg', quality=95)
 
 
-def build_records(dataset_root: Path, excel_dir: Path, image_dir: Path,
-                  traced_dir: Path, sample_ids: List[int],
+def build_records(dataset_root: Path, excel_map: Dict[str, Path],
+                  image_map: Dict[str, Path], traced_map: Dict[str, Path],
+                  sample_ids: List[int],
+                  sample_key_by_id: Dict[int, str],
                   summary: dict, source_canvas_width: Optional[int],
                   source_canvas_height: int, point_offset_x: float,
                   point_offset_y: float):
-    excel_map = {
-        legacy.extract_sample_id(path): path
-        for path in sorted(excel_dir.glob('*.xlsx'))
-        if not path.name.startswith('.~') and not path.name.startswith('~$')
-    }
-    image_map = {
-        legacy.extract_sample_id(path): path
-        for path in sorted(image_dir.glob('*')) if path.is_file()
-    }
-    traced_map = {
-        legacy.extract_sample_id(path): path
-        for path in sorted(traced_dir.glob('*')) if path.is_file()
-    }
-
-    records: Dict[int, legacy.ImageRecord] = {}
+    records: Dict[int, common.ImageRecord] = {}
     images: List[dict] = []
     image_id_map: Dict[int, int] = {}
     for image_id, sample_id in enumerate(sample_ids):
-        record = legacy.build_record(
+        sample_key = sample_key_by_id[sample_id]
+        record = common.build_record(
             sample_id=sample_id,
-            image_path=image_map[sample_id],
-            traced_image_path=traced_map.get(sample_id),
-            excel_path=excel_map[sample_id],
+            image_path=image_map[sample_key],
+            traced_image_path=traced_map.get(sample_key),
+            excel_path=excel_map[sample_key],
             source_canvas_width=source_canvas_width,
             source_canvas_height=source_canvas_height,
             point_offset_x=point_offset_x,
@@ -384,20 +534,20 @@ def build_records(dataset_root: Path, excel_dir: Path, image_dir: Path,
         image_id_map[sample_id] = image_id
         images.append({
             'id': image_id,
-            'file_name': legacy.relative_file_name(dataset_root, record.image_path),
+            'file_name': common.relative_file_name(dataset_root, record.image_path),
             'width': record.width,
             'height': record.height,
         })
     return records, images, image_id_map
 
 
-def build_annotations(records: Dict[int, legacy.ImageRecord],
+def build_annotations(records: Dict[int, common.ImageRecord],
                       image_id_map: Dict[int, int], summary: dict) -> List[dict]:
     annotations: List[dict] = []
     annotation_id = 0
     for sample_id, record in records.items():
         image_id = image_id_map[sample_id]
-        for tooth_id in legacy.TARGET_TEETH:
+        for tooth_id in common.TARGET_TEETH:
             resolved = resolve_strict_pair_entries(
                 tooth_id, record.side_entries.get(tooth_id, []), summary)
             if resolved is None:
@@ -440,27 +590,32 @@ def main() -> None:
     args = parse_args()
     dataset_root = args.dataset_root
     output_dir = args.output_dir or dataset_root / 'annotations_v2'
-    excel_dir = args.excel_subdir or legacy.detect_subdir(dataset_root, ['excel', 'Excel'])
-    image_dir = args.image_subdir or legacy.detect_subdir(dataset_root, ['原图'])
-    traced_dir = args.traced_subdir or legacy.detect_subdir(dataset_root, ['描点图'])
+    excel_dir = args.excel_subdir or common.detect_subdir(dataset_root, ['excel', 'Excel'])
+    image_dir = args.image_subdir or common.detect_subdir(dataset_root, ['原图'])
+    traced_dir = args.traced_subdir or common.detect_subdir(dataset_root, ['描点图'])
 
-    excel_ids = {
-        legacy.extract_sample_id(path)
-        for path in sorted(excel_dir.glob('*.xlsx'))
-        if not path.name.startswith('.~') and not path.name.startswith('~$')
+    excel_map, image_map, traced_map, common_sample_keys, mode_stats = (
+        select_sample_sources(excel_dir, image_dir, traced_dir, require_traced=False))
+    if args.sample_limit is not None:
+        common_sample_keys = common_sample_keys[:args.sample_limit]
+    sample_key_by_id = {
+        sample_id: sample_key
+        for sample_id, sample_key in enumerate(common_sample_keys)
     }
-    image_ids = {
-        legacy.extract_sample_id(path)
-        for path in sorted(image_dir.glob('*')) if path.is_file()
-    }
-    sample_ids = sorted(excel_ids & image_ids)
+    sample_ids = sorted(sample_key_by_id.keys())
     if args.sample_limit is not None:
         sample_ids = sample_ids[:args.sample_limit]
 
     summary = initial_summary(dataset_root, excel_dir, image_dir, traced_dir, args)
-    summary['num_excels'] = len(excel_ids)
-    summary['num_images'] = len(image_ids)
+    summary['num_excels'] = mode_stats['num_valid_excels']
+    summary['num_images'] = mode_stats['num_valid_images']
+    summary['num_traced_images'] = mode_stats['num_valid_traced_images']
     summary['num_samples_before_filtering'] = len(sample_ids)
+    summary.update(mode_stats)
+    summary['num_samples_with_traced_image'] = len(
+        set(common_sample_keys) & set(traced_map.keys()))
+    summary['num_samples_missing_traced_image'] = len(common_sample_keys) - len(
+        set(common_sample_keys) & set(traced_map.keys()))
 
     if args.sample_list_json is not None:
         allowed_sample_ids = set(load_sample_ids_from_json(args.sample_list_json))
@@ -491,10 +646,11 @@ def main() -> None:
     initial_point_offset_y = float(args.point_offset_y or 0.0)
     records, images, image_id_map = build_records(
         dataset_root,
-        excel_dir,
-        image_dir,
-        traced_dir,
+        excel_map,
+        image_map,
+        traced_map,
         sample_ids,
+        sample_key_by_id,
         summary,
         source_canvas_width=args.source_canvas_width,
         source_canvas_height=args.source_canvas_height,
@@ -510,7 +666,7 @@ def main() -> None:
     write_json(output_dir / 'panoramic_teeth_instances_all.json', full_payload)
 
     if not args.skip_split:
-        split_map = legacy.split_dataset(sample_ids, args.train_ratio,
+        split_map = common.split_dataset(sample_ids, args.train_ratio,
                                          args.val_ratio, args.test_ratio,
                                          args.seed)
         summary['splits'] = {name: len(ids) for name, ids in split_map.items()}

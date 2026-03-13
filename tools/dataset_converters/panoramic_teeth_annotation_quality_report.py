@@ -21,7 +21,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import panoramic_teeth_excel_to_coco as legacy  # noqa: E402
+import panoramic_teeth_converter_common as common  # noqa: E402
 import panoramic_teeth_excel_to_coco_v2 as converter_v2  # noqa: E402
 
 Point2D = Tuple[float, float]
@@ -116,14 +116,14 @@ def nearest_point_offset(
     return best[0], best[1], math.sqrt(best[2])
 
 
-def iter_eval_points(record: legacy.ImageRecord) -> List[Point2D]:
+def iter_eval_points(record: common.ImageRecord) -> List[Point2D]:
     scratch_summary: DefaultDict[str, int] = defaultdict(int)
     points: List[Point2D] = []
-    for tooth_id in legacy.TARGET_TEETH:
-        resolved = legacy.resolve_entries_for_tooth(
+    for tooth_id in common.TARGET_TEETH:
+        resolved = common.resolve_entries_for_tooth(
             tooth_id, record.side_entries.get(tooth_id, []), scratch_summary)
         for entry in resolved.values():
-            converted_points, visibility = legacy.convert_side_entry(entry)
+            converted_points, visibility = common.convert_side_entry(entry)
             for point, point_visibility in zip(converted_points, visibility):
                 if point_visibility <= 0:
                     continue
@@ -133,7 +133,7 @@ def iter_eval_points(record: legacy.ImageRecord) -> List[Point2D]:
 
 def summarize_matches(
     sample_id: int,
-    record: legacy.ImageRecord,
+    record: common.ImageRecord,
     matches: List[Tuple[float, float, float]],
     total_points: int,
     total_blue_points: int,
@@ -200,16 +200,19 @@ def write_csv(path: Path, rows: Sequence[dict]) -> None:
         writer.writerows(rows)
 
 
-def build_records(sample_ids: Sequence[int], dataset_root: Path, excel_dir: Path,
-                  image_dir: Path, traced_dir: Path,
-                  args: argparse.Namespace) -> Dict[int, legacy.ImageRecord]:
+def build_records(sample_ids: Sequence[int], dataset_root: Path,
+                  excel_map: Dict[str, Path], image_map: Dict[str, Path],
+                  traced_map: Dict[str, Path],
+                  sample_key_by_id: Dict[int, str],
+                  args: argparse.Namespace) -> Dict[int, common.ImageRecord]:
     summary: DefaultDict[str, int] = defaultdict(int)
     records, _, _ = converter_v2.build_records(
         dataset_root,
-        excel_dir,
-        image_dir,
-        traced_dir,
+        excel_map,
+        image_map,
+        traced_map,
         list(sample_ids),
+        sample_key_by_id,
         summary,
         args.source_canvas_width,
         args.source_canvas_height,
@@ -229,29 +232,27 @@ def main() -> None:
     args = parse_args()
     dataset_root = args.dataset_root
     output_dir = args.output_dir or dataset_root / 'annotation_quality_report'
-    excel_dir = legacy.detect_subdir(dataset_root, ['excel', 'Excel'])
-    image_dir = legacy.detect_subdir(dataset_root, ['原图'])
-    traced_dir = legacy.detect_subdir(dataset_root, ['描点图'])
+    excel_dir = common.detect_subdir(dataset_root, ['excel', 'Excel'])
+    image_dir = common.detect_subdir(dataset_root, ['原图'])
+    traced_dir = common.detect_subdir(dataset_root, ['描点图'])
 
-    excel_ids = {
-        legacy.extract_sample_id(path)
-        for path in sorted(excel_dir.glob('*.xlsx'))
-        if not path.name.startswith('.~') and not path.name.startswith('~$')
+    excel_map, image_map, traced_map, common_sample_keys, _ = (
+        converter_v2.select_sample_sources(
+            excel_dir, image_dir, traced_dir, require_traced=True))
+    sample_key_by_id = {
+        sample_id: sample_key
+        for sample_id, sample_key in enumerate(common_sample_keys)
     }
-    image_ids = {
-        legacy.extract_sample_id(path)
-        for path in sorted(image_dir.glob('*')) if path.is_file()
-    }
-    traced_ids = {
-        legacy.extract_sample_id(path)
-        for path in sorted(traced_dir.glob('*')) if path.is_file()
-    }
-    sample_ids = sorted(excel_ids & image_ids & traced_ids)
+    sample_ids = sorted(sample_key_by_id.keys())
     if args.sample_limit is not None:
         sample_ids = sample_ids[:args.sample_limit]
+        sample_key_by_id = {
+            sample_id: sample_key_by_id[sample_id]
+            for sample_id in sample_ids
+        }
 
-    records = build_records(sample_ids, dataset_root, excel_dir, image_dir,
-                            traced_dir, args)
+    records = build_records(sample_ids, dataset_root, excel_map, image_map,
+                            traced_map, sample_key_by_id, args)
     metrics: List[dict] = []
 
     for sample_id in sample_ids:

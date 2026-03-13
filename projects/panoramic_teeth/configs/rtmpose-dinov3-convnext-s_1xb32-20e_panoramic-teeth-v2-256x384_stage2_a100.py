@@ -4,7 +4,7 @@ _base_ = [
     './rtmpose-dinov3-convnext-s_1xb64-60e_panoramic-teeth-v2-256x384_stage1_a100.py'
 ]
 
-max_epochs = 20
+max_epochs = 50
 base_lr = 2.5e-5
 backend_args = dict(backend='local')
 stage1_work_dir = Path(

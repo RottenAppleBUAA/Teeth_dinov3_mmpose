@@ -3,8 +3,8 @@ custom_imports = dict(
 
 _base_ = ['../../../configs/_base_/default_runtime.py']
 
-max_epochs = 60
-stage2_num_epochs = 10
+max_epochs = 200
+stage2_num_epochs = 50
 base_lr = 2e-3
 
 train_cfg = dict(max_epochs=max_epochs, val_interval=5)

@@ -426,6 +426,21 @@ def make_tooth_color(index: int) -> tuple[int, int, int]:
     return palette[index % len(palette)]
 
 
+def draw_keypoint_polyline(canvas: np.ndarray,
+                           points: np.ndarray,
+                           color: tuple[int, int, int],
+                           thickness: int = 2) -> None:
+    polyline = np.round(points).astype(np.int32).reshape(-1, 1, 2)
+    if len(polyline) < 2:
+        return
+    cv2.polylines(
+        canvas, [polyline], isClosed=False, color=(0, 0, 0),
+        thickness=thickness + 2, lineType=cv2.LINE_AA)
+    cv2.polylines(
+        canvas, [polyline], isClosed=False, color=color,
+        thickness=thickness, lineType=cv2.LINE_AA)
+
+
 def render_panoramic_overlay(image: np.ndarray,
                              teeth_predictions: Sequence[dict],
                              keypoint_colors: Sequence[Sequence[int]]) -> np.ndarray:
@@ -445,6 +460,17 @@ def render_panoramic_overlay(image: np.ndarray,
         contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(canvas, contours, -1, color, 2)
+
+        mesial_line = np.asarray(
+            [tooth['keypoints_xy'][0], tooth['keypoints_xy'][1],
+             tooth['keypoints_xy'][2]],
+            dtype=np.float32)
+        distal_line = np.asarray(
+            [tooth['keypoints_xy'][4], tooth['keypoints_xy'][3],
+             tooth['keypoints_xy'][2]],
+            dtype=np.float32)
+        draw_keypoint_polyline(canvas, mesial_line, keypoint_palette[0])
+        draw_keypoint_polyline(canvas, distal_line, keypoint_palette[4])
 
         for kp_index, point in enumerate(tooth['keypoints_xy']):
             point_int = tuple(np.round(point).astype(int))

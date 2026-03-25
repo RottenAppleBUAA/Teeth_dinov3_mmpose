@@ -218,10 +218,11 @@ def prepare_cfg(cfg: Config, cfg_options: dict) -> tuple[Config, bool]:
                          f'be {expected_pack_type}, but got '
                          f'{pack_cfg.get("type")}.')
 
-    meta_keys = list(pack_cfg.get('meta_keys', ()))
-    if 'bbox_rotation' not in meta_keys:
-        meta_keys.append('bbox_rotation')
-    pack_cfg['meta_keys'] = tuple(meta_keys)
+    if 'meta_keys' in pack_cfg:
+        meta_keys = list(pack_cfg['meta_keys'])
+        if 'bbox_rotation' not in meta_keys:
+            meta_keys.append('bbox_rotation')
+        pack_cfg['meta_keys'] = tuple(meta_keys)
     pack_cfg['pack_transformed'] = False
 
     cfg.test_dataloader.dataset.pipeline = inference_pipeline
@@ -842,4 +843,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

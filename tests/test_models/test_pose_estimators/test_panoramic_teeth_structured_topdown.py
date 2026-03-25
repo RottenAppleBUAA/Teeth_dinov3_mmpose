@@ -210,6 +210,47 @@ def test_base_structured_config_builds_and_runs():
     assert hasattr(batch_results[0].pred_fields, 'distal_boundary')
 
 
+def test_structured_head_decodes_contours_from_boundary_logits():
+    register_all_modules()
+    importlib.import_module('projects.panoramic_teeth_structured')
+
+    from projects.panoramic_teeth_structured.models.structured_contour_head import (
+        StructuredContourHead)
+
+    head = StructuredContourHead(
+        in_channels=32,
+        input_size=(256, 384),
+        contour_points=16,
+        feat_channels=32,
+        num_convs=1,
+        contour_hidden_dim=64,
+        row_sigma=6.0,
+        contour_temperature=40.0)
+
+    structure_logits = torch.full((1, 3, 384, 256), -8.0)
+    structure_logits[:, 0, 40:340, 60:196] = 8.0
+    structure_logits[:, 1, :, 72] = 8.0
+    structure_logits[:, 2, :, 182] = 8.0
+    pooled = torch.zeros((1, 64), dtype=torch.float32)
+
+    with torch.no_grad():
+        contours = head._decode_contours_from_structure(structure_logits, pooled)
+        keypoints = head._derive_keypoints(contours)
+
+    mesial_x = contours[0, 0, :, 0]
+    distal_x = contours[0, 1, :, 0]
+    assert torch.allclose(
+        mesial_x,
+        torch.full_like(mesial_x, 72.0),
+        atol=1.0)
+    assert torch.allclose(
+        distal_x,
+        torch.full_like(distal_x, 182.0),
+        atol=1.0)
+    assert abs(float(keypoints[0, 0, 0]) - 72.0) < 1.0
+    assert abs(float(keypoints[0, 4, 0]) - 182.0) < 1.0
+
+
 def test_stage1_and_stage2_structured_dinov3_train_smoke(monkeypatch, tmp_path):
     _patch_transformers(monkeypatch)
     checkpoint_dir = _make_fake_checkpoint_dir(tmp_path)

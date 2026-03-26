@@ -20,6 +20,172 @@ def _should_swap_sides(direction: str) -> bool:
 
 
 @TRANSFORMS.register_module()
+class ExpandToothBBox(BaseTransform):
+    """Expand a root-based bbox into a larger single-tooth context box.
+
+    The source annotations currently build bbox from the root polygon, which is
+    too tight for anatomy-aware landmarks such as B/C. This transform expands
+    the bbox asymmetrically to include crown, gingiva and alveolar context.
+    """
+
+    def __init__(self,
+                 left_ratio: float = 0.35,
+                 right_ratio: float = 0.35,
+                 top_ratio: float = 0.70,
+                 bottom_ratio: float = 0.30,
+                 occlusal_shift_ratio: float = 0.0,
+                 upper_height_scale: float = 1.0,
+                 upper_post_shift_ratio: float = 0.0,
+                 min_pad_x: float = 24.0,
+                 min_pad_top: float = 72.0,
+                 min_pad_bottom: float = 36.0,
+                 use_tooth_id_templates: bool = True,
+                 clip_border: bool = True) -> None:
+        self.left_ratio = float(left_ratio)
+        self.right_ratio = float(right_ratio)
+        self.top_ratio = float(top_ratio)
+        self.bottom_ratio = float(bottom_ratio)
+        self.occlusal_shift_ratio = float(occlusal_shift_ratio)
+        self.upper_height_scale = float(upper_height_scale)
+        self.upper_post_shift_ratio = float(upper_post_shift_ratio)
+        self.min_pad_x = float(min_pad_x)
+        self.min_pad_top = float(min_pad_top)
+        self.min_pad_bottom = float(min_pad_bottom)
+        self.use_tooth_id_templates = bool(use_tooth_id_templates)
+        self.clip_border = bool(clip_border)
+
+    def _resolve_template(self, tooth_id: Optional[int]) -> dict:
+        template = dict(
+            left_ratio=self.left_ratio,
+            right_ratio=self.right_ratio,
+            top_ratio=self.top_ratio,
+            bottom_ratio=self.bottom_ratio,
+            occlusal_shift_ratio=self.occlusal_shift_ratio,
+            upper_height_scale=self.upper_height_scale,
+            upper_post_shift_ratio=self.upper_post_shift_ratio,
+            min_pad_x=self.min_pad_x,
+            min_pad_top=self.min_pad_top,
+            min_pad_bottom=self.min_pad_bottom)
+
+        if not self.use_tooth_id_templates or tooth_id is None:
+            return template
+
+        quadrant = int(tooth_id) // 10
+        tooth_index = int(tooth_id) % 10
+
+        # Narrower lateral context for incisors/canines, slightly wider for
+        # posterior teeth. Use mild vertical bias by arch to reduce useless
+        # context on the opposite side.
+        if tooth_index <= 3:
+            template.update(
+                left_ratio=0.07,
+                right_ratio=0.07,
+                top_ratio=1.10,
+                bottom_ratio=0.20,
+                occlusal_shift_ratio=0.20,
+                min_pad_x=8.0,
+                min_pad_top=108.0,
+                min_pad_bottom=20.0)
+        elif tooth_index <= 5:
+            template.update(
+                left_ratio=0.10,
+                right_ratio=0.10,
+                top_ratio=0.95,
+                bottom_ratio=0.24,
+                occlusal_shift_ratio=0.15,
+                min_pad_x=10.0,
+                min_pad_top=96.0,
+                min_pad_bottom=24.0)
+        else:
+            template.update(
+                left_ratio=0.14,
+                right_ratio=0.14,
+                top_ratio=0.82,
+                bottom_ratio=0.30,
+                occlusal_shift_ratio=0.10,
+                min_pad_x=14.0,
+                min_pad_top=84.0,
+                min_pad_bottom=28.0)
+
+        if quadrant in {1, 2}:  # upper teeth: preserve more coronal context
+            template['top_ratio'] += 0.10
+            template['bottom_ratio'] = max(0.16,
+                                           template['bottom_ratio'] - 0.04)
+            template['min_pad_top'] += 12.0
+            template['occlusal_shift_ratio'] += 0.10
+            template['upper_height_scale'] = 2.0 / 3.0
+            template['upper_post_shift_ratio'] = 0.25
+        elif quadrant in {3, 4}:  # lower teeth: preserve more apical context
+            template['top_ratio'] = max(0.60, template['top_ratio'] - 0.08)
+            template['bottom_ratio'] += 0.10
+            template['min_pad_bottom'] += 12.0
+
+        return template
+
+    def transform(self, results: Dict) -> Optional[dict]:
+        bbox = np.asarray(results['bbox'], dtype=np.float32).reshape(-1, 4).copy()
+        img_shape = results.get('img_shape', results.get('ori_shape', None))
+        img_h, img_w = (img_shape[:2] if img_shape is not None else (None, None))
+        tooth_id = results.get('tooth_id')
+        template = self._resolve_template(tooth_id)
+
+        widths = np.maximum(bbox[:, 2] - bbox[:, 0], 1.0)
+        heights = np.maximum(bbox[:, 3] - bbox[:, 1], 1.0)
+
+        pad_left = np.maximum(widths * template['left_ratio'],
+                              template['min_pad_x'])
+        pad_right = np.maximum(widths * template['right_ratio'],
+                               template['min_pad_x'])
+        pad_top = np.maximum(heights * template['top_ratio'],
+                             template['min_pad_top'])
+        pad_bottom = np.maximum(heights * template['bottom_ratio'],
+                                template['min_pad_bottom'])
+        shift_y = np.zeros_like(heights)
+        if tooth_id is not None:
+            quadrant = int(tooth_id) // 10
+            shift_sign = 1.0 if quadrant in {1, 2} else -1.0
+            shift_y = heights * template['occlusal_shift_ratio'] * shift_sign
+
+        bbox[:, 0] = bbox[:, 0] - pad_left
+        bbox[:, 1] = bbox[:, 1] - pad_top + shift_y
+        bbox[:, 2] = bbox[:, 2] + pad_right
+        bbox[:, 3] = bbox[:, 3] + pad_bottom + shift_y
+
+        if tooth_id is not None and int(tooth_id) // 10 in {1, 2}:
+            current_h = np.maximum(bbox[:, 3] - bbox[:, 1], 1.0)
+            center_y = 0.5 * (bbox[:, 1] + bbox[:, 3])
+            center_y = center_y + current_h * template['upper_post_shift_ratio']
+            new_h = current_h * template['upper_height_scale']
+            bbox[:, 1] = center_y - 0.5 * new_h
+            bbox[:, 3] = center_y + 0.5 * new_h
+
+        if self.clip_border and img_w is not None and img_h is not None:
+            bbox[:, 0] = np.clip(bbox[:, 0], 0, img_w - 1)
+            bbox[:, 1] = np.clip(bbox[:, 1], 0, img_h - 1)
+            bbox[:, 2] = np.clip(bbox[:, 2], 0, img_w - 1)
+            bbox[:, 3] = np.clip(bbox[:, 3], 0, img_h - 1)
+
+        results['bbox'] = bbox.astype(np.float32)
+        return results
+
+    def __repr__(self) -> str:
+        return (
+            f'{self.__class__.__name__}('
+            f'left_ratio={self.left_ratio}, '
+            f'right_ratio={self.right_ratio}, '
+            f'top_ratio={self.top_ratio}, '
+            f'bottom_ratio={self.bottom_ratio}, '
+            f'occlusal_shift_ratio={self.occlusal_shift_ratio}, '
+            f'upper_height_scale={self.upper_height_scale}, '
+            f'upper_post_shift_ratio={self.upper_post_shift_ratio}, '
+            f'min_pad_x={self.min_pad_x}, '
+            f'min_pad_top={self.min_pad_top}, '
+            f'min_pad_bottom={self.min_pad_bottom}, '
+            f'use_tooth_id_templates={self.use_tooth_id_templates}, '
+            f'clip_border={self.clip_border})')
+
+
+@TRANSFORMS.register_module()
 class GenerateStructuredToothTargets(BaseTransform):
     """Generate contour, boundary, mask and geometry targets."""
 

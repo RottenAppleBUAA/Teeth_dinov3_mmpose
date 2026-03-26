@@ -42,8 +42,6 @@ class StructuredContourHead(BaseHead):
                  feat_channels: int = 256,
                  num_convs: int = 2,
                  contour_hidden_dim: int = 512,
-                 row_sigma: float = 6.0,
-                 contour_temperature: float = 20.0,
                  root_bce_weight: float = 1.0,
                  root_dice_weight: float = 1.0,
                  boundary_bce_weight: float = 1.0,
@@ -64,8 +62,6 @@ class StructuredContourHead(BaseHead):
         self.input_size = tuple(int(v) for v in input_size)
         self.contour_points = int(contour_points)
         self.order_margin = float(order_margin)
-        self.row_sigma = float(row_sigma)
-        self.contour_temperature = float(contour_temperature)
 
         self.root_bce_weight = float(root_bce_weight)
         self.root_dice_weight = float(root_dice_weight)
@@ -88,66 +84,10 @@ class StructuredContourHead(BaseHead):
             current_channels = feat_channels
         self.decoder = nn.Sequential(*layers)
         self.structure_classifier = nn.Conv2d(current_channels, 3, kernel_size=1)
-        self.depth_mlp = nn.Sequential(
+        self.contour_mlp = nn.Sequential(
             nn.Linear(current_channels * 2, contour_hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(contour_hidden_dim, self.contour_points + 1))
-
-    def _decode_depth_anchors(self, pooled: Tensor, height: int) -> Tensor:
-        depth_params = self.depth_mlp(pooled)
-        top_raw = depth_params[:, 0]
-        span_raw = depth_params[:, 1]
-        seg_raw = depth_params[:, 2:]
-
-        max_y = float(max(height - 1, 1))
-        top = torch.sigmoid(top_raw) * max_y
-        span = torch.sigmoid(span_raw) * (max_y - top)
-
-        segments = F.softplus(seg_raw) + 1e-4
-        cumulative = torch.cumsum(segments, dim=1)
-        cumulative = cumulative / cumulative[:, -1:].clamp_min(1e-6)
-        start = torch.zeros_like(top[:, None])
-        return top[:, None] + span[:, None] * torch.cat([start, cumulative], dim=1)
-
-    def _decode_contours_from_structure(self, structure_logits: Tensor,
-                                        pooled: Tensor) -> Tensor:
-        structure_probs = structure_logits.sigmoid()
-        root_gate = 0.5 + 0.5 * structure_probs[:, 0:1]
-        boundary_probs = structure_probs[:, 1:3] * root_gate
-
-        _, _, height, width = boundary_probs.shape
-        y_anchors = self._decode_depth_anchors(pooled, height)
-
-        y_coords = torch.arange(
-            height, device=boundary_probs.device,
-            dtype=boundary_probs.dtype).view(1, 1, height)
-        x_coords = torch.arange(
-            width, device=boundary_probs.device,
-            dtype=boundary_probs.dtype).view(1, 1, width)
-
-        row_sigma = max(self.row_sigma, 1e-3)
-        row_prior = torch.exp(-0.5 * ((y_coords - y_anchors.unsqueeze(-1)) /
-                                      row_sigma)**2)
-        row_prior = row_prior / row_prior.sum(dim=-1,
-                                              keepdim=True).clamp_min(1e-6)
-
-        contours = []
-        for side_idx in range(2):
-            side_response = boundary_probs[:, side_idx].unsqueeze(1)
-            point_response = side_response * row_prior.unsqueeze(-1)
-
-            x_scores = point_response.sum(dim=2)
-            x_probs = F.softmax(x_scores * self.contour_temperature, dim=-1)
-            x = (x_probs * x_coords).sum(dim=-1)
-
-            y_scores = point_response.sum(dim=3) + row_prior * 1e-3
-            y_probs = y_scores / y_scores.sum(dim=-1, keepdim=True).clamp_min(
-                1e-6)
-            y = (y_probs * y_coords).sum(dim=-1)
-
-            contours.append(torch.stack([x, y], dim=-1))
-
-        return torch.stack(contours, dim=1)
+            nn.Linear(contour_hidden_dim, 2 * self.contour_points * 2))
 
     def _structure_forward(self, feats: Tuple[Tensor]) -> Tuple[Tensor, Tensor]:
         x = feats[-1]
@@ -163,8 +103,13 @@ class StructuredContourHead(BaseHead):
 
         avg = F.adaptive_avg_pool2d(x, 1).flatten(1)
         max_pool = F.adaptive_max_pool2d(x, 1).flatten(1)
-        pooled = torch.cat([avg, max_pool], dim=1)
-        contour = self._decode_contours_from_structure(structure_logits, pooled)
+        contour = self.contour_mlp(torch.cat([avg, max_pool], dim=1))
+        contour = contour.view(-1, 2, self.contour_points, 2).sigmoid()
+
+        width = max(self.input_size[0] - 1, 1)
+        height = max(self.input_size[1] - 1, 1)
+        contour = torch.cat(
+            [contour[..., 0:1] * width, contour[..., 1:2] * height], dim=-1)
         return structure_logits, contour
 
     @staticmethod

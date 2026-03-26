@@ -6,7 +6,7 @@ _base_ = ['../../../configs/_base_/default_runtime.py']
 
 max_epochs = 200
 base_lr = 2e-3
-input_size = (256, 384)
+input_size = (192, 512)
 contour_points = 16
 
 train_cfg = dict(max_epochs=max_epochs, val_interval=5)
@@ -52,8 +52,6 @@ model = dict(
         feat_channels=256,
         num_convs=2,
         contour_hidden_dim=512,
-        row_sigma=6.0,
-        contour_temperature=20.0,
         root_bce_weight=1.0,
         root_dice_weight=1.0,
         boundary_bce_weight=1.0,
@@ -76,7 +74,8 @@ backend_args = dict(backend='local')
 
 train_pipeline = [
     dict(type='LoadImage', backend_args=backend_args),
-    dict(type='GetBBoxCenterScale'),
+    dict(type='ExpandToothBBox', use_tooth_id_templates=True),
+    dict(type='GetBBoxCenterScale', padding=1.0),
     dict(type='RandomFlip', direction='horizontal'),
     dict(
         type='RandomBBoxTransform',
@@ -93,7 +92,8 @@ train_pipeline = [
 
 val_pipeline = [
     dict(type='LoadImage', backend_args=backend_args),
-    dict(type='GetBBoxCenterScale'),
+    dict(type='ExpandToothBBox', use_tooth_id_templates=True),
+    dict(type='GetBBoxCenterScale', padding=1.0),
     dict(type='TopdownAffine', input_size=input_size),
     dict(
         type='GenerateStructuredToothTargets',

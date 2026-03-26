@@ -98,21 +98,21 @@ def _make_fake_checkpoint_dir(tmp_path):
 
 
 def _make_structured_targets():
-    height, width = 384, 256
-    ys = torch.linspace(40.0, 330.0, 16)
-    mesial = torch.stack([torch.linspace(60.0, 84.0, 16), ys], dim=1)
-    distal = torch.stack([torch.linspace(196.0, 172.0, 16), ys], dim=1)
+    height, width = 512, 192
+    ys = torch.linspace(56.0, 450.0, 16)
+    mesial = torch.stack([torch.linspace(44.0, 66.0, 16), ys], dim=1)
+    distal = torch.stack([torch.linspace(148.0, 126.0, 16), ys], dim=1)
     apex = 0.5 * (mesial[-1] + distal[-1])
     keypoints = torch.stack([mesial[0], mesial[1], apex, distal[1], distal[0]],
                             dim=0)
 
     root_mask = torch.zeros(1, height, width, dtype=torch.float32)
-    root_mask[:, 40:340, 60:196] = 1.0
+    root_mask[:, 56:456, 44:148] = 1.0
 
     mesial_boundary = torch.zeros(1, height, width, dtype=torch.float32)
-    mesial_boundary[:, 40:340, 60:63] = 1.0
+    mesial_boundary[:, 56:456, 44:47] = 1.0
     distal_boundary = torch.zeros(1, height, width, dtype=torch.float32)
-    distal_boundary[:, 40:340, 193:196] = 1.0
+    distal_boundary[:, 56:456, 145:148] = 1.0
 
     mesial_distance = torch.zeros(1, height, width, dtype=torch.float32)
     distal_distance = torch.zeros(1, height, width, dtype=torch.float32)
@@ -133,8 +133,8 @@ def _make_packed_inputs(batch_size=2):
         batch_size=batch_size,
         num_instances=1,
         num_keypoints=5,
-        img_shape=(384, 256),
-        input_size=(256, 384),
+        img_shape=(512, 192),
+        input_size=(192, 512),
         with_heatmap=False,
         with_reg_label=False,
         with_simcc_label=False)
@@ -208,47 +208,6 @@ def test_base_structured_config_builds_and_runs():
     assert hasattr(batch_results[0].pred_fields, 'root_mask')
     assert hasattr(batch_results[0].pred_fields, 'mesial_boundary')
     assert hasattr(batch_results[0].pred_fields, 'distal_boundary')
-
-
-def test_structured_head_decodes_contours_from_boundary_logits():
-    register_all_modules()
-    importlib.import_module('projects.panoramic_teeth_structured')
-
-    from projects.panoramic_teeth_structured.models.structured_contour_head import (
-        StructuredContourHead)
-
-    head = StructuredContourHead(
-        in_channels=32,
-        input_size=(256, 384),
-        contour_points=16,
-        feat_channels=32,
-        num_convs=1,
-        contour_hidden_dim=64,
-        row_sigma=6.0,
-        contour_temperature=40.0)
-
-    structure_logits = torch.full((1, 3, 384, 256), -8.0)
-    structure_logits[:, 0, 40:340, 60:196] = 8.0
-    structure_logits[:, 1, :, 72] = 8.0
-    structure_logits[:, 2, :, 182] = 8.0
-    pooled = torch.zeros((1, 64), dtype=torch.float32)
-
-    with torch.no_grad():
-        contours = head._decode_contours_from_structure(structure_logits, pooled)
-        keypoints = head._derive_keypoints(contours)
-
-    mesial_x = contours[0, 0, :, 0]
-    distal_x = contours[0, 1, :, 0]
-    assert torch.allclose(
-        mesial_x,
-        torch.full_like(mesial_x, 72.0),
-        atol=1.0)
-    assert torch.allclose(
-        distal_x,
-        torch.full_like(distal_x, 182.0),
-        atol=1.0)
-    assert abs(float(keypoints[0, 0, 0]) - 72.0) < 1.0
-    assert abs(float(keypoints[0, 4, 0]) - 182.0) < 1.0
 
 
 def test_stage1_and_stage2_structured_dinov3_train_smoke(monkeypatch, tmp_path):

@@ -5,6 +5,7 @@ from typing import Dict, Optional
 import numpy as np
 from mmcv.transforms import BaseTransform
 
+from mmpose.registry import KEYPOINT_CODECS
 from mmpose.datasets.transforms import PackPoseInputs
 from mmpose.registry import TRANSFORMS
 from mmpose.structures.bbox import get_udp_warp_matrix, get_warp_matrix
@@ -313,6 +314,145 @@ class GenerateStructuredToothTargets(BaseTransform):
 
 
 @TRANSFORMS.register_module()
+class GenerateAnatomicalToothTargets(GenerateStructuredToothTargets):
+    """Generate structured targets plus anatomy-aware point supervision."""
+
+    def __init__(self,
+                 num_contour_points: int = 16,
+                 line_width: int = 2,
+                 use_udp: bool = False,
+                 point_encoder: Optional[dict] = None) -> None:
+        super().__init__(
+            num_contour_points=num_contour_points,
+            line_width=line_width,
+            use_udp=use_udp)
+        if point_encoder is None:
+            point_encoder = dict(
+                type='SimCCLabel',
+                input_size=(192, 512),
+                sigma=(5.66, 5.66),
+                simcc_split_ratio=2.0,
+                normalize=False,
+                use_dark=False)
+        self.point_encoder_cfg = point_encoder.copy()
+        self.point_encoder = KEYPOINT_CODECS.build(self.point_encoder_cfg)
+
+    def _build_warp_mat(self, results: Dict) -> np.ndarray:
+        center = np.array(results['input_center'], dtype=np.float32)
+        scale = np.array(results['input_scale'], dtype=np.float32)
+        input_width, input_height = results['input_size']
+        rotation = results.get('bbox_rotation', np.array([0.0], dtype=np.float32))
+        if isinstance(rotation, np.ndarray):
+            rotation = float(rotation.reshape(-1)[0])
+        else:
+            rotation = float(rotation)
+
+        if self.use_udp:
+            return get_udp_warp_matrix(
+                center, scale, rotation, output_size=(input_width, input_height))
+        return get_warp_matrix(
+            center, scale, rotation, output_size=(input_width, input_height))
+
+    def _transform_apex_midpoint(self, results: Dict) -> np.ndarray:
+        apex_midpoint = np.asarray(
+            results.get('apex_midpoint', np.zeros((2, ), dtype=np.float32)),
+            dtype=np.float32).reshape(-1, 2)
+        if apex_midpoint.size == 0:
+            return np.zeros((2, ), dtype=np.float32)
+
+        if results.get('flip', False):
+            apex_midpoint = flip_points(
+                apex_midpoint, results['img_shape'],
+                results.get('flip_direction', 'horizontal'))
+
+        warp_mat = self._build_warp_mat(results)
+        apex_midpoint = transform_points(apex_midpoint, warp_mat)
+        return apex_midpoint.reshape(-1, 2)[0].astype(np.float32)
+
+    def _encode_subset(self,
+                       keypoints: np.ndarray,
+                       keypoint_weights: np.ndarray,
+                       indices) -> Dict[str, np.ndarray]:
+        encoded = self.point_encoder.encode(
+            keypoints=keypoints[None, indices, :],
+            keypoints_visible=keypoint_weights[None, indices])
+        return encoded
+
+    def transform(self, results: Dict) -> Optional[dict]:
+        results = super().transform(results)
+        if results is None:
+            return None
+
+        keypoint_target = np.asarray(results['keypoint_target'],
+                                     dtype=np.float32).reshape(5, 2)
+        keypoint_weights = np.asarray(results['keypoint_weights'],
+                                      dtype=np.float32).reshape(5)
+        mesial_contour = np.asarray(results['mesial_contour'],
+                                    dtype=np.float32).reshape(-1, 2)
+        distal_contour = np.asarray(results['distal_contour'],
+                                    dtype=np.float32).reshape(-1, 2)
+        input_width, input_height = results['input_size']
+
+        mesial_tail = mesial_contour[2:] if len(mesial_contour) > 2 else mesial_contour[-1:]
+        distal_tail = distal_contour[2:] if len(distal_contour) > 2 else distal_contour[-1:]
+        mesial_anatomy = np.concatenate(
+            [keypoint_target[[0, 1]], mesial_tail], axis=0).astype(np.float32)
+        distal_anatomy = np.concatenate(
+            [keypoint_target[[4, 3]], distal_tail], axis=0).astype(np.float32)
+
+        mesial_anatomy_map = rasterize_polyline(
+            mesial_anatomy,
+            width=int(input_width),
+            height=int(input_height),
+            thickness=self.line_width)
+        distal_anatomy_map = rasterize_polyline(
+            distal_anatomy,
+            width=int(input_width),
+            height=int(input_height),
+            thickness=self.line_width)
+
+        normalize_by = float(max(input_width, input_height))
+        mesial_anatomy_distance = distance_transform_from_binary(
+            mesial_anatomy_map, normalize_by)
+        distal_anatomy_distance = distance_transform_from_binary(
+            distal_anatomy_map, normalize_by)
+
+        apex_midpoint_target = self._transform_apex_midpoint(results)
+        if not np.isfinite(apex_midpoint_target).all():
+            apex_midpoint_target = keypoint_target[2].copy()
+
+        mesial_encoded = self._encode_subset(keypoint_target, keypoint_weights,
+                                             [0, 1])
+        apex_encoded = self._encode_subset(keypoint_target, keypoint_weights,
+                                           [2])
+        distal_encoded = self._encode_subset(keypoint_target, keypoint_weights,
+                                             [3, 4])
+
+        results['mesial_anatomy'] = mesial_anatomy_map[None, ...]
+        results['distal_anatomy'] = distal_anatomy_map[None, ...]
+        results['mesial_anatomy_distance'] = mesial_anatomy_distance[None, ...]
+        results['distal_anatomy_distance'] = distal_anatomy_distance[None, ...]
+        results['apex_midpoint_target'] = apex_midpoint_target.astype(np.float32)
+
+        results['mesial_keypoint_x_labels'] = mesial_encoded['keypoint_x_labels']
+        results['mesial_keypoint_y_labels'] = mesial_encoded['keypoint_y_labels']
+        results['mesial_keypoint_weights'] = mesial_encoded['keypoint_weights']
+        results['apex_keypoint_x_labels'] = apex_encoded['keypoint_x_labels']
+        results['apex_keypoint_y_labels'] = apex_encoded['keypoint_y_labels']
+        results['apex_keypoint_weights'] = apex_encoded['keypoint_weights']
+        results['distal_keypoint_x_labels'] = distal_encoded['keypoint_x_labels']
+        results['distal_keypoint_y_labels'] = distal_encoded['keypoint_y_labels']
+        results['distal_keypoint_weights'] = distal_encoded['keypoint_weights']
+        return results
+
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}('
+                f'num_contour_points={self.num_contour_points}, '
+                f'line_width={self.line_width}, use_udp={self.use_udp}, '
+                f'point_encoder={self.point_encoder_cfg})')
+
+
+@TRANSFORMS.register_module()
 class PackStructuredToothInputs(PackPoseInputs):
     """Pack structured tooth targets for contour reconstruction training."""
 
@@ -353,4 +493,39 @@ class PackStructuredToothInputs(PackPoseInputs):
             if key in results:
                 results[key] = np.expand_dims(
                     np.asarray(results[key], dtype=np.float32), axis=0)
+        return super().transform(results)
+
+
+@TRANSFORMS.register_module()
+class PackAnatomicalToothInputs(PackStructuredToothInputs):
+    """Pack anatomy-aware structured tooth targets."""
+
+    def transform(self, results: dict) -> dict:
+        field_mapping = dict(results.get('field_mapping_table', {}))
+        field_mapping.update(
+            mesial_anatomy='mesial_anatomy',
+            distal_anatomy='distal_anatomy',
+            mesial_anatomy_distance='mesial_anatomy_distance',
+            distal_anatomy_distance='distal_anatomy_distance')
+        results['field_mapping_table'] = field_mapping
+
+        label_mapping = dict(results.get('label_mapping_table', {}))
+        label_mapping.update(
+            apex_midpoint_target='apex_midpoint_target',
+            mesial_keypoint_x_labels='mesial_keypoint_x_labels',
+            mesial_keypoint_y_labels='mesial_keypoint_y_labels',
+            mesial_keypoint_weights='mesial_keypoint_weights',
+            apex_keypoint_x_labels='apex_keypoint_x_labels',
+            apex_keypoint_y_labels='apex_keypoint_y_labels',
+            apex_keypoint_weights='apex_keypoint_weights',
+            distal_keypoint_x_labels='distal_keypoint_x_labels',
+            distal_keypoint_y_labels='distal_keypoint_y_labels',
+            distal_keypoint_weights='distal_keypoint_weights')
+        results['label_mapping_table'] = label_mapping
+
+        for key in ('apex_midpoint_target', ):
+            if key in results:
+                results[key] = np.expand_dims(
+                    np.asarray(results[key], dtype=np.float32), axis=0)
+
         return super().transform(results)

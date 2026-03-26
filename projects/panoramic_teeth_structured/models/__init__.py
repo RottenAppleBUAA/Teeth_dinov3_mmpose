@@ -1,5 +1,7 @@
+from .anatomical_rtmcc_head import AnatomicalRTMCCHead
 from .dinov3_convnext_backbone import DINOv3ConvNextBackbone
 from .structured_contour_head import StructuredContourHead
 
-__all__ = ['DINOv3ConvNextBackbone', 'StructuredContourHead']
-
+__all__ = [
+    'AnatomicalRTMCCHead', 'DINOv3ConvNextBackbone', 'StructuredContourHead'
+]

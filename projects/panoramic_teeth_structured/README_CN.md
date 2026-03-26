@@ -88,6 +88,21 @@ projects/panoramic_teeth_structured/configs/panoramic-teeth-structured_dinov3-co
 projects/panoramic_teeth_structured/configs/panoramic-teeth-structured_dinov3-convnext-s_8xb32-50e_v2-256x384_stage2.py
 ```
 
+解剖点主头实验配置：
+
+```text
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical_r50_8xb32-200e_v2-192x512.py
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical_dinov3-convnext-s_8xb32-200e_v2-192x512_stage1.py
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical_dinov3-convnext-s_8xb32-50e_v2-192x512_stage2.py
+```
+
+这组 anatomy 配置采用：
+
+- `RTMCC / SimCC` 作为关键点主任务
+- `A`、`M_C/M_B`、`D_B/D_C` 三个解剖子头
+- `root / mesial / distal` 结构图和 contour 作为辅助语义分支
+- 基于现有 keypoint 和 side contour 自动构造的 anatomy pseudo targets
+
 当前默认训练时长为：
 
 - Stage 1: `200` epochs

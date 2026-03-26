@@ -12,7 +12,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from projects.panoramic_teeth_structured.datasets.transforms import (  # noqa: E402
-    ExpandToothBBox, GenerateStructuredToothTargets)
+    ExpandToothBBox, GenerateAnatomicalToothTargets,
+    GenerateStructuredToothTargets)
 
 
 def test_expand_tooth_bbox_adds_anatomical_context():
@@ -139,3 +140,53 @@ def test_generate_structured_tooth_targets_outputs_expected_fields():
         0.5 *
         (output['mesial_contour'][-1] + output['distal_contour'][-1]),
         atol=1e-5)
+
+
+def test_generate_anatomical_tooth_targets_outputs_anatomy_fields():
+    transform = GenerateAnatomicalToothTargets(
+        num_contour_points=16,
+        line_width=2,
+        use_udp=False,
+        point_encoder=dict(
+            type='SimCCLabel',
+            input_size=(100, 100),
+            sigma=(4.0, 4.0),
+            simcc_split_ratio=2.0,
+            normalize=False,
+            use_dark=False))
+
+    results = dict(
+        root_polygon=np.array([[25.0, 10.0], [20.0, 75.0], [40.0, 95.0],
+                               [60.0, 95.0], [80.0, 75.0], [75.0, 10.0]],
+                              dtype=np.float32),
+        side_contours=dict(
+            M=np.array([[25.0, 10.0], [22.0, 30.0], [24.0, 55.0], [40.0, 95.0]],
+                       dtype=np.float32),
+            D=np.array([[75.0, 10.0], [78.0, 30.0], [76.0, 55.0], [60.0, 95.0]],
+                       dtype=np.float32)),
+        apex_midpoint=np.array([50.0, 95.0], dtype=np.float32),
+        img_shape=(100, 100),
+        input_center=np.array([50.0, 50.0], dtype=np.float32),
+        input_scale=np.array([100.0, 100.0], dtype=np.float32),
+        input_size=(100, 100),
+        bbox_rotation=np.array([0.0], dtype=np.float32),
+        transformed_keypoints=np.array([[[25.0, 10.0], [22.0, 30.0],
+                                         [50.0, 95.0], [78.0, 30.0],
+                                         [75.0, 10.0]]],
+                                       dtype=np.float32),
+        keypoints_visible=np.ones((1, 5, 1), dtype=np.float32))
+
+    output = transform(results)
+
+    assert output is not None
+    assert output['mesial_anatomy'].shape == (1, 100, 100)
+    assert output['distal_anatomy'].shape == (1, 100, 100)
+    assert output['mesial_anatomy_distance'].shape == (1, 100, 100)
+    assert output['distal_anatomy_distance'].shape == (1, 100, 100)
+    assert output['apex_midpoint_target'].shape == (2, )
+    assert output['mesial_keypoint_x_labels'].shape == (1, 2, 200)
+    assert output['mesial_keypoint_y_labels'].shape == (1, 2, 200)
+    assert output['apex_keypoint_x_labels'].shape == (1, 1, 200)
+    assert output['apex_keypoint_y_labels'].shape == (1, 1, 200)
+    assert output['distal_keypoint_x_labels'].shape == (1, 2, 200)
+    assert output['distal_keypoint_y_labels'].shape == (1, 2, 200)

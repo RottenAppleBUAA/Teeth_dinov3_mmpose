@@ -202,7 +202,10 @@ def prepare_cfg(cfg: Config, cfg_options: dict) -> tuple[Config, bool]:
     inference_pipeline = []
     for transform in pipeline_cfg:
         transform_type = transform.get('type')
-        if transform_type in {'GenerateStructuredToothTargets', 'GenerateTarget'}:
+        if transform_type in {
+                'GenerateStructuredToothTargets', 'GenerateAnatomicalToothTargets',
+                'GenerateAnatomicalPointMaskTargets', 'GenerateTarget'
+        }:
             continue
         if transform_type in {'RandomFlip', 'RandomBBoxTransform'}:
             continue
@@ -212,10 +215,13 @@ def prepare_cfg(cfg: Config, cfg_options: dict) -> tuple[Config, bool]:
         raise ValueError('Inference pipeline became empty after filtering.')
 
     pack_cfg = inference_pipeline[-1]
-    expected_pack_type = 'PackStructuredToothInputs'
-    if pack_cfg.get('type') != expected_pack_type:
+    expected_pack_types = {
+        'PackStructuredToothInputs', 'PackAnatomicalToothInputs',
+        'PackAnatomicalPointMaskInputs'
+    }
+    if pack_cfg.get('type') not in expected_pack_types:
         raise ValueError('The last transform in the inference pipeline must '
-                         f'be {expected_pack_type}, but got '
+                         f'be one of {sorted(expected_pack_types)}, but got '
                          f'{pack_cfg.get("type")}.')
 
     if 'meta_keys' in pack_cfg:
@@ -417,12 +423,33 @@ def decode_ann_keypoints(ann: dict) -> tuple[np.ndarray, np.ndarray]:
     return values[:, :2], values[:, 2]
 
 
+def derive_polylines_from_keypoints(keypoints: np.ndarray
+                                    ) -> tuple[np.ndarray, np.ndarray]:
+    keypoints = np.asarray(keypoints, dtype=np.float32).reshape(-1, 2)
+    if len(keypoints) < 5:
+        return (np.zeros((0, 2), dtype=np.float32),
+                np.zeros((0, 2), dtype=np.float32))
+    mesial = keypoints[[0, 1, 2]].astype(np.float32)
+    distal = keypoints[[4, 3, 2]].astype(np.float32)
+    return mesial, distal
+
+
 def build_gt_records(annotations: Sequence[dict],
                      image_size: tuple[int, int]) -> list[dict]:
     records = []
     for ann in annotations:
         keypoints, visibility = decode_ann_keypoints(ann)
         side_contours = ann.get('side_contours', {})
+        mesial_polyline, distal_polyline = derive_polylines_from_keypoints(
+            keypoints)
+        mesial_contour = np.asarray(
+            side_contours.get('M', []), dtype=np.float32).reshape(-1, 2)
+        distal_contour = np.asarray(
+            side_contours.get('D', []), dtype=np.float32).reshape(-1, 2)
+        if len(mesial_contour) < 2:
+            mesial_contour = mesial_polyline
+        if len(distal_contour) < 2:
+            distal_contour = distal_polyline
         records.append(
             dict(
                 annotation_id=int(ann['id']),
@@ -430,10 +457,10 @@ def build_gt_records(annotations: Sequence[dict],
                 bbox_xywh=[float(v) for v in ann.get('bbox', [])],
                 keypoints_xy=keypoints.astype(np.float32),
                 keypoint_scores=visibility.astype(np.float32),
-                mesial_contour=np.asarray(
-                    side_contours.get('M', []), dtype=np.float32).reshape(-1, 2),
-                distal_contour=np.asarray(
-                    side_contours.get('D', []), dtype=np.float32).reshape(-1, 2),
+                mesial_contour=mesial_contour,
+                distal_contour=distal_contour,
+                mesial_polyline=mesial_polyline,
+                distal_polyline=distal_polyline,
                 mask_binary=segmentation_to_mask(ann.get('segmentation', []),
                                                  image_size),
             ))
@@ -471,6 +498,12 @@ def build_pred_records(predictions,
             getattr(pred_instances, 'mesial_contour', None), prediction, use_udp)
         distal_contour = transform_crop_points_to_image(
             getattr(pred_instances, 'distal_contour', None), prediction, use_udp)
+        mesial_polyline, distal_polyline = derive_polylines_from_keypoints(
+            keypoints_xy)
+        if len(mesial_contour) < 2:
+            mesial_contour = mesial_polyline
+        if len(distal_contour) < 2:
+            distal_contour = distal_polyline
 
         records.append(
             dict(
@@ -482,6 +515,8 @@ def build_pred_records(predictions,
                 np.asarray(keypoint_scores, dtype=np.float32),
                 mesial_contour=mesial_contour.astype(np.float32),
                 distal_contour=distal_contour.astype(np.float32),
+                mesial_polyline=mesial_polyline.astype(np.float32),
+                distal_polyline=distal_polyline.astype(np.float32),
                 mask_binary=root_mask_binary,
             ))
     return records
@@ -652,6 +687,12 @@ def serialize_records(records: Sequence[dict],
                 keypoints=build_keypoint_payload(
                     record.get('keypoints_xy', []),
                     record.get('keypoint_scores'), keypoint_names),
+                mesial_polyline=np.asarray(
+                    record.get('mesial_polyline', record.get('mesial_contour', [])),
+                    dtype=np.float32).reshape(-1, 2).astype(float).tolist(),
+                distal_polyline=np.asarray(
+                    record.get('distal_polyline', record.get('distal_contour', [])),
+                    dtype=np.float32).reshape(-1, 2).astype(float).tolist(),
                 mesial_contour=np.asarray(
                     record.get('mesial_contour', []),
                     dtype=np.float32).reshape(-1, 2).astype(float).tolist(),

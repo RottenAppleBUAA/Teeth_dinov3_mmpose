@@ -453,6 +453,199 @@ class GenerateAnatomicalToothTargets(GenerateStructuredToothTargets):
 
 
 @TRANSFORMS.register_module()
+class GenerateAnatomicalPointMaskTargets(BaseTransform):
+    """Generate root-mask and point-driven polyline targets.
+
+    This variant removes explicit side-line / contour supervision. Mesial and
+    distal dense cues are derived directly from the 5 annotated anatomical
+    landmarks using the fixed order:
+      mesial: M_C -> M_B -> A
+      distal: D_C -> D_B -> A
+    """
+
+    def __init__(self,
+                 line_width: int = 2,
+                 use_udp: bool = False,
+                 point_encoder: Optional[dict] = None) -> None:
+        self.line_width = int(line_width)
+        self.use_udp = bool(use_udp)
+        if point_encoder is None:
+            point_encoder = dict(
+                type='SimCCLabel',
+                input_size=(192, 512),
+                sigma=(5.66, 5.66),
+                simcc_split_ratio=2.0,
+                normalize=False,
+                use_dark=False)
+        self.point_encoder_cfg = point_encoder.copy()
+        self.point_encoder = KEYPOINT_CODECS.build(self.point_encoder_cfg)
+
+    def _build_warp_mat(self, results: Dict) -> np.ndarray:
+        center = np.array(results['input_center'], dtype=np.float32)
+        scale = np.array(results['input_scale'], dtype=np.float32)
+        input_width, input_height = results['input_size']
+        rotation = results.get('bbox_rotation', np.array([0.0], dtype=np.float32))
+        if isinstance(rotation, np.ndarray):
+            rotation = float(rotation.reshape(-1)[0])
+        else:
+            rotation = float(rotation)
+
+        if self.use_udp:
+            return get_udp_warp_matrix(
+                center, scale, rotation, output_size=(input_width, input_height))
+        return get_warp_matrix(
+            center, scale, rotation, output_size=(input_width, input_height))
+
+    def _transform_polygon(self, results: Dict) -> np.ndarray:
+        polygon = np.asarray(
+            results.get('root_polygon', []), dtype=np.float32).reshape(-1, 2)
+        if len(polygon) < 3:
+            return polygon
+        if results.get('flip', False):
+            polygon = flip_points(
+                polygon, results['img_shape'],
+                results.get('flip_direction', 'horizontal'))
+        warp_mat = self._build_warp_mat(results)
+        return transform_points(polygon, warp_mat)
+
+    def _extract_keypoint_targets(self, results: Dict) -> np.ndarray:
+        transformed_keypoints = np.asarray(
+            results.get('transformed_keypoints', np.zeros((1, 5, 2))),
+            dtype=np.float32)
+        if transformed_keypoints.ndim >= 3 and transformed_keypoints.size > 0:
+            return transformed_keypoints[0, :, :2].astype(np.float32)
+
+        raw_keypoints = np.asarray(
+            results.get('keypoints', np.zeros((1, 5, 2))), dtype=np.float32)
+        if raw_keypoints.ndim >= 3 and raw_keypoints.size > 0:
+            raw_keypoints = raw_keypoints[0, :, :2]
+        elif raw_keypoints.ndim == 2:
+            raw_keypoints = raw_keypoints[:, :2]
+        else:
+            return np.zeros((5, 2), dtype=np.float32)
+
+        if results.get('flip', False):
+            raw_keypoints = flip_points(
+                raw_keypoints, results['img_shape'],
+                results.get('flip_direction', 'horizontal'))
+            if _should_swap_sides(results.get('flip_direction', 'horizontal')):
+                raw_keypoints = raw_keypoints[[4, 3, 2, 1, 0]]
+
+        warp_mat = self._build_warp_mat(results)
+        return transform_points(raw_keypoints, warp_mat).astype(np.float32)
+
+    def _extract_keypoint_weights(self, results: Dict) -> np.ndarray:
+        keypoint_visible = results.get('keypoints_visible', None)
+        if keypoint_visible is not None:
+            keypoint_visible = np.asarray(keypoint_visible, dtype=np.float32)
+            if keypoint_visible.ndim == 3:
+                weights = keypoint_visible[0, :, 0]
+            elif keypoint_visible.ndim == 2:
+                weights = keypoint_visible[0]
+            elif keypoint_visible.ndim == 1:
+                weights = keypoint_visible
+            else:
+                raise ValueError(
+                    f'Unexpected keypoints_visible shape: '
+                    f'{keypoint_visible.shape!r}')
+            return np.asarray(weights, dtype=np.float32)
+        return np.ones((5, ), dtype=np.float32)
+
+    def _transform_apex_midpoint(self, results: Dict) -> np.ndarray:
+        apex_midpoint = np.asarray(
+            results.get('apex_midpoint', np.zeros((2, ), dtype=np.float32)),
+            dtype=np.float32).reshape(-1, 2)
+        if apex_midpoint.size == 0:
+            return np.zeros((2, ), dtype=np.float32)
+
+        if results.get('flip', False):
+            apex_midpoint = flip_points(
+                apex_midpoint, results['img_shape'],
+                results.get('flip_direction', 'horizontal'))
+
+        warp_mat = self._build_warp_mat(results)
+        apex_midpoint = transform_points(apex_midpoint, warp_mat)
+        return apex_midpoint.reshape(-1, 2)[0].astype(np.float32)
+
+    def _encode_subset(self,
+                       keypoints: np.ndarray,
+                       keypoint_weights: np.ndarray,
+                       indices) -> Dict[str, np.ndarray]:
+        return self.point_encoder.encode(
+            keypoints=keypoints[None, indices, :],
+            keypoints_visible=keypoint_weights[None, indices])
+
+    def transform(self, results: Dict) -> Optional[dict]:
+        polygon = self._transform_polygon(results)
+        if len(polygon) < 3:
+            return None
+
+        keypoint_target = self._extract_keypoint_targets(results)
+        if keypoint_target.shape != (5, 2):
+            return None
+        keypoint_weights = self._extract_keypoint_weights(results)
+        input_width, input_height = results['input_size']
+
+        root_mask = rasterize_polygon(
+            polygon, width=int(input_width), height=int(input_height))
+
+        mesial_polyline = keypoint_target[[0, 1, 2]].astype(np.float32)
+        distal_polyline = keypoint_target[[4, 3, 2]].astype(np.float32)
+        mesial_polyline_map = rasterize_polyline(
+            mesial_polyline,
+            width=int(input_width),
+            height=int(input_height),
+            thickness=self.line_width)
+        distal_polyline_map = rasterize_polyline(
+            distal_polyline,
+            width=int(input_width),
+            height=int(input_height),
+            thickness=self.line_width)
+
+        normalize_by = float(max(input_width, input_height))
+        mesial_polyline_distance = distance_transform_from_binary(
+            mesial_polyline_map, normalize_by)
+        distal_polyline_distance = distance_transform_from_binary(
+            distal_polyline_map, normalize_by)
+
+        apex_midpoint_target = self._transform_apex_midpoint(results)
+        if not np.isfinite(apex_midpoint_target).all():
+            apex_midpoint_target = keypoint_target[2].copy()
+
+        mesial_encoded = self._encode_subset(keypoint_target, keypoint_weights,
+                                             [0, 1])
+        apex_encoded = self._encode_subset(keypoint_target, keypoint_weights,
+                                           [2])
+        distal_encoded = self._encode_subset(keypoint_target, keypoint_weights,
+                                             [3, 4])
+
+        results['root_mask'] = root_mask[None, ...]
+        results['keypoint_target'] = keypoint_target.astype(np.float32)
+        results['keypoint_weights'] = keypoint_weights.astype(np.float32)
+        results['mesial_polyline_map'] = mesial_polyline_map[None, ...]
+        results['distal_polyline_map'] = distal_polyline_map[None, ...]
+        results['mesial_polyline_distance'] = mesial_polyline_distance[None, ...]
+        results['distal_polyline_distance'] = distal_polyline_distance[None, ...]
+        results['apex_midpoint_target'] = apex_midpoint_target.astype(np.float32)
+
+        results['mesial_keypoint_x_labels'] = mesial_encoded['keypoint_x_labels']
+        results['mesial_keypoint_y_labels'] = mesial_encoded['keypoint_y_labels']
+        results['mesial_keypoint_weights'] = mesial_encoded['keypoint_weights']
+        results['apex_keypoint_x_labels'] = apex_encoded['keypoint_x_labels']
+        results['apex_keypoint_y_labels'] = apex_encoded['keypoint_y_labels']
+        results['apex_keypoint_weights'] = apex_encoded['keypoint_weights']
+        results['distal_keypoint_x_labels'] = distal_encoded['keypoint_x_labels']
+        results['distal_keypoint_y_labels'] = distal_encoded['keypoint_y_labels']
+        results['distal_keypoint_weights'] = distal_encoded['keypoint_weights']
+        return results
+
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}('
+                f'line_width={self.line_width}, use_udp={self.use_udp}, '
+                f'point_encoder={self.point_encoder_cfg})')
+
+
+@TRANSFORMS.register_module()
 class PackStructuredToothInputs(PackPoseInputs):
     """Pack structured tooth targets for contour reconstruction training."""
 
@@ -524,6 +717,56 @@ class PackAnatomicalToothInputs(PackStructuredToothInputs):
         results['label_mapping_table'] = label_mapping
 
         for key in ('apex_midpoint_target', ):
+            if key in results:
+                results[key] = np.expand_dims(
+                    np.asarray(results[key], dtype=np.float32), axis=0)
+
+        return super().transform(results)
+
+
+@TRANSFORMS.register_module()
+class PackAnatomicalPointMaskInputs(PackPoseInputs):
+    """Pack point+mask anatomy targets."""
+
+    def __init__(self,
+                 meta_keys=('id', 'img_id', 'img_path', 'category_id',
+                            'ori_shape', 'img_shape', 'input_size',
+                            'input_center', 'input_scale', 'flip',
+                            'flip_direction', 'flip_indices', 'raw_ann_info',
+                            'dataset_name', 'tooth_id'),
+                 pack_transformed: bool = False):
+        super().__init__(
+            meta_keys=meta_keys, pack_transformed=pack_transformed)
+
+    def transform(self, results: dict) -> dict:
+        field_mapping = dict(self.field_mapping_table)
+        field_mapping.update(results.get('field_mapping_table', {}))
+        field_mapping.update(
+            root_mask='root_mask',
+            mesial_polyline_map='mesial_polyline_map',
+            distal_polyline_map='distal_polyline_map',
+            mesial_polyline_distance='mesial_polyline_distance',
+            distal_polyline_distance='distal_polyline_distance')
+        results['field_mapping_table'] = field_mapping
+
+        label_mapping = dict(self.label_mapping_table)
+        label_mapping.update(results.get('label_mapping_table', {}))
+        label_mapping.update(
+            keypoint_target='keypoint_targets',
+            apex_midpoint_target='apex_midpoint_target',
+            mesial_keypoint_x_labels='mesial_keypoint_x_labels',
+            mesial_keypoint_y_labels='mesial_keypoint_y_labels',
+            mesial_keypoint_weights='mesial_keypoint_weights',
+            apex_keypoint_x_labels='apex_keypoint_x_labels',
+            apex_keypoint_y_labels='apex_keypoint_y_labels',
+            apex_keypoint_weights='apex_keypoint_weights',
+            distal_keypoint_x_labels='distal_keypoint_x_labels',
+            distal_keypoint_y_labels='distal_keypoint_y_labels',
+            distal_keypoint_weights='distal_keypoint_weights')
+        results['label_mapping_table'] = label_mapping
+
+        for key in ('keypoint_target', 'keypoint_weights',
+                    'apex_midpoint_target'):
             if key in results:
                 results[key] = np.expand_dims(
                     np.asarray(results[key], dtype=np.float32), axis=0)

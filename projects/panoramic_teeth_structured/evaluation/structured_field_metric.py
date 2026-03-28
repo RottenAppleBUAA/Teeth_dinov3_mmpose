@@ -129,3 +129,46 @@ class StructuredFieldMetric(BaseMetric):
             distal_mDice=distal_dice,
             boundary_mDice=float((mesial_dice + distal_dice) * 0.5))
 
+
+@METRICS.register_module()
+class RootMaskMetric(BaseMetric):
+    """Evaluate root-mask IoU and Dice only."""
+
+    default_prefix = 'structured'
+
+    def __init__(self,
+                 threshold: float = 0.5,
+                 collect_device: str = 'cpu',
+                 prefix: str = 'structured'):
+        super().__init__(collect_device=collect_device, prefix=prefix)
+        self.threshold = float(threshold)
+
+    def process(self, data_batch: Sequence[dict],
+                data_samples: Sequence[dict]) -> None:
+        for data_sample in data_samples:
+            pred_fields = _extract_field(data_sample, 'pred_fields')
+            gt_fields = _extract_field(data_sample, 'gt_fields')
+            if pred_fields is None or gt_fields is None:
+                continue
+
+            root_overlap = _compute_binary_overlap(
+                _extract_map(pred_fields, 'root_mask'),
+                _extract_map(gt_fields, 'root_mask'), self.threshold)
+            self.results.append(root_overlap)
+
+    def compute_metrics(self, results: list) -> Dict[str, float]:
+        if not results:
+            return dict(root_mIoU=0.0, root_mDice=0.0)
+
+        root_i = np.array([item['intersection'] for item in results],
+                          dtype=np.float32)
+        root_u = np.array([item['union'] for item in results],
+                          dtype=np.float32)
+        root_p = np.array([item['pred_area'] for item in results],
+                          dtype=np.float32)
+        root_g = np.array([item['gt_area'] for item in results],
+                          dtype=np.float32)
+        root_iou = root_i / np.maximum(root_u, 1.0)
+        root_dice = (2 * root_i) / np.maximum(root_p + root_g, 1.0)
+        return dict(
+            root_mIoU=float(root_iou.mean()), root_mDice=float(root_dice.mean()))

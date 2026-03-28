@@ -94,6 +94,8 @@ projects/panoramic_teeth_structured/configs/panoramic-teeth-structured_dinov3-co
 projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical_r50_8xb32-200e_v2-192x512.py
 projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical_dinov3-convnext-s_8xb32-200e_v2-192x512_stage1.py
 projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical_dinov3-convnext-s_8xb32-50e_v2-192x512_stage2.py
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical_dinov3-convnext-b_8xb32-200e_v2-192x512_stage1.py
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical_dinov3-convnext-b_8xb32-50e_v2-192x512_stage2.py
 ```
 
 这组 anatomy 配置采用：
@@ -102,6 +104,23 @@ projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical_dinov3-co
 - `A`、`M_C/M_B`、`D_B/D_C` 三个解剖子头
 - `root / mesial / distal` 结构图和 contour 作为辅助语义分支
 - 基于现有 keypoint 和 side contour 自动构造的 anatomy pseudo targets
+
+简化版 `point+mask` anatomy 配置：
+
+```text
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical-pointmask_r50_8xb32-200e_v2-192x512.py
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical-pointmask_dinov3-convnext-s_8xb32-200e_v2-192x512_stage1.py
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical-pointmask_dinov3-convnext-s_8xb32-50e_v2-192x512_stage2.py
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical-pointmask_dinov3-convnext-b_8xb32-200e_v2-192x512_stage1.py
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical-pointmask_dinov3-convnext-b_8xb32-50e_v2-192x512_stage2.py
+```
+
+这组 point+mask 配置采用：
+
+- `RTMCC / SimCC` 作为 `5` 个解剖点主任务
+- 仅保留 `root mask` 作为结构辅助任务
+- `mesial/distal` 稠密监督由 `M_C -> M_B -> A` 和 `D_C -> D_B -> A` 两条伪线在线生成
+- 推理时不再单独预测 contour，显示用 side line 由点直接连接生成
 
 当前默认训练时长为：
 
@@ -122,3 +141,8 @@ projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical_dinov3-co
 - `mesial_mDice`
 - `distal_mDice`
 - `boundary_mDice`
+
+对于 `point+mask` 配置，结构评估改为 `RootMaskMetric`，仅统计：
+
+- `root_mIoU`
+- `root_mDice`

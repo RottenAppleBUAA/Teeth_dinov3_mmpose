@@ -12,7 +12,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from projects.panoramic_teeth_structured.datasets.transforms import (  # noqa: E402
-    ExpandToothBBox, GenerateAnatomicalToothTargets,
+    ExpandToothBBox, GenerateAnatomicalPointMaskTargets,
+    GenerateAnatomicalToothTargets,
     GenerateStructuredToothTargets)
 
 
@@ -190,3 +191,47 @@ def test_generate_anatomical_tooth_targets_outputs_anatomy_fields():
     assert output['apex_keypoint_y_labels'].shape == (1, 1, 200)
     assert output['distal_keypoint_x_labels'].shape == (1, 2, 200)
     assert output['distal_keypoint_y_labels'].shape == (1, 2, 200)
+
+
+def test_generate_anatomical_pointmask_targets_outputs_point_driven_fields():
+    transform = GenerateAnatomicalPointMaskTargets(
+        line_width=2,
+        use_udp=False,
+        point_encoder=dict(
+            type='SimCCLabel',
+            input_size=(100, 100),
+            sigma=(4.0, 4.0),
+            simcc_split_ratio=2.0,
+            normalize=False,
+            use_dark=False))
+
+    results = dict(
+        root_polygon=np.array([[25.0, 10.0], [20.0, 75.0], [40.0, 95.0],
+                               [60.0, 95.0], [80.0, 75.0], [75.0, 10.0]],
+                              dtype=np.float32),
+        apex_midpoint=np.array([50.0, 95.0], dtype=np.float32),
+        img_shape=(100, 100),
+        input_center=np.array([50.0, 50.0], dtype=np.float32),
+        input_scale=np.array([100.0, 100.0], dtype=np.float32),
+        input_size=(100, 100),
+        bbox_rotation=np.array([0.0], dtype=np.float32),
+        transformed_keypoints=np.array([[[25.0, 10.0], [22.0, 30.0],
+                                         [50.0, 95.0], [78.0, 30.0],
+                                         [75.0, 10.0]]],
+                                       dtype=np.float32),
+        keypoints_visible=np.ones((1, 5, 1), dtype=np.float32))
+
+    output = transform(results)
+
+    assert output is not None
+    assert output['root_mask'].shape == (1, 100, 100)
+    assert output['mesial_polyline_map'].shape == (1, 100, 100)
+    assert output['distal_polyline_map'].shape == (1, 100, 100)
+    assert output['mesial_polyline_distance'].shape == (1, 100, 100)
+    assert output['distal_polyline_distance'].shape == (1, 100, 100)
+    assert output['apex_midpoint_target'].shape == (2, )
+    assert output['mesial_keypoint_x_labels'].shape == (1, 2, 200)
+    assert output['apex_keypoint_x_labels'].shape == (1, 1, 200)
+    assert output['distal_keypoint_x_labels'].shape == (1, 2, 200)
+    assert 'mesial_boundary' not in output
+    assert 'mesial_contour' not in output

@@ -89,3 +89,14 @@ def test_load_annotation_bundle_and_match_image_info(tmp_path):
 
     assert bundle['anns_by_image'][1][0]['id'] == 7
     assert matched['id'] == 1
+
+
+def test_derive_polylines_from_keypoints_returns_expected_order():
+    keypoints = np.array(
+        [[12, 12], [15, 20], [18, 28], [24, 20], [28, 12]],
+        dtype=np.float32)
+
+    mesial, distal = vis.derive_polylines_from_keypoints(keypoints)
+
+    np.testing.assert_array_equal(mesial, keypoints[[0, 1, 2]])
+    np.testing.assert_array_equal(distal, keypoints[[4, 3, 2]])

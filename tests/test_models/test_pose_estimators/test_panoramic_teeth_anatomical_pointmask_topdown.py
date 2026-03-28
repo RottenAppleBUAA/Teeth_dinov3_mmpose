@@ -126,45 +126,29 @@ def _make_fake_checkpoint_dir(tmp_path):
 
 def _make_targets():
     height, width = 512, 192
-    ys = torch.linspace(96.0, 440.0, 16)
-    mesial = torch.stack([torch.linspace(44.0, 70.0, 16), ys], dim=1)
-    distal = torch.stack([torch.linspace(148.0, 122.0, 16), ys], dim=1)
-    apex = 0.5 * (mesial[-1] + distal[-1])
-    keypoints = torch.stack([mesial[0], mesial[1], apex, distal[1], distal[0]],
-                            dim=0)
+    keypoints = torch.tensor(
+        [[44.0, 96.0], [68.0, 168.0], [96.0, 440.0], [124.0, 168.0],
+         [148.0, 96.0]],
+        dtype=torch.float32)
 
     root_mask = torch.zeros(1, height, width, dtype=torch.float32)
     root_mask[:, 96:452, 44:148] = 1.0
 
-    mesial_boundary = torch.zeros(1, height, width, dtype=torch.float32)
-    mesial_boundary[:, 96:452, 44:47] = 1.0
-    distal_boundary = torch.zeros(1, height, width, dtype=torch.float32)
-    distal_boundary[:, 96:452, 145:148] = 1.0
+    mesial_polyline_map = torch.zeros(1, height, width, dtype=torch.float32)
+    mesial_polyline_map[:, 96:441, 44:69] = 1.0
+    distal_polyline_map = torch.zeros(1, height, width, dtype=torch.float32)
+    distal_polyline_map[:, 96:441, 124:149] = 1.0
 
-    mesial_anatomy = torch.zeros(1, height, width, dtype=torch.float32)
-    mesial_anatomy[:, 96:452, 44:49] = 1.0
-    distal_anatomy = torch.zeros(1, height, width, dtype=torch.float32)
-    distal_anatomy[:, 96:452, 143:148] = 1.0
-
-    mesial_distance = torch.zeros(1, height, width, dtype=torch.float32)
-    distal_distance = torch.zeros(1, height, width, dtype=torch.float32)
-    mesial_anatomy_distance = torch.zeros(1, height, width, dtype=torch.float32)
-    distal_anatomy_distance = torch.zeros(1, height, width, dtype=torch.float32)
+    mesial_polyline_distance = torch.zeros(1, height, width, dtype=torch.float32)
+    distal_polyline_distance = torch.zeros(1, height, width, dtype=torch.float32)
 
     return dict(
-        mesial=mesial,
-        distal=distal,
-        apex=apex,
         keypoints=keypoints,
         root_mask=root_mask,
-        mesial_boundary=mesial_boundary,
-        distal_boundary=distal_boundary,
-        mesial_distance=mesial_distance,
-        distal_distance=distal_distance,
-        mesial_anatomy=mesial_anatomy,
-        distal_anatomy=distal_anatomy,
-        mesial_anatomy_distance=mesial_anatomy_distance,
-        distal_anatomy_distance=distal_anatomy_distance)
+        mesial_polyline_map=mesial_polyline_map,
+        distal_polyline_map=distal_polyline_map,
+        mesial_polyline_distance=mesial_polyline_distance,
+        distal_polyline_distance=distal_polyline_distance)
 
 
 def _make_packed_inputs(batch_size=2):
@@ -200,21 +184,14 @@ def _make_packed_inputs(batch_size=2):
     for data_sample in packed_inputs['data_samples']:
         data_sample.gt_fields = PixelData(
             root_mask=targets['root_mask'].clone(),
-            mesial_boundary=targets['mesial_boundary'].clone(),
-            distal_boundary=targets['distal_boundary'].clone(),
-            mesial_distance=targets['mesial_distance'].clone(),
-            distal_distance=targets['distal_distance'].clone(),
-            mesial_anatomy=targets['mesial_anatomy'].clone(),
-            distal_anatomy=targets['distal_anatomy'].clone(),
-            mesial_anatomy_distance=targets['mesial_anatomy_distance'].clone(),
-            distal_anatomy_distance=targets['distal_anatomy_distance'].clone())
+            mesial_polyline_map=targets['mesial_polyline_map'].clone(),
+            distal_polyline_map=targets['distal_polyline_map'].clone(),
+            mesial_polyline_distance=targets['mesial_polyline_distance'].clone(),
+            distal_polyline_distance=targets['distal_polyline_distance'].clone())
         data_sample.gt_instance_labels = InstanceData(
             keypoint_targets=targets['keypoints'].clone().unsqueeze(0),
             keypoint_weights=torch.ones(1, 5, dtype=torch.float32),
-            mesial_contour=targets['mesial'].clone().unsqueeze(0),
-            distal_contour=targets['distal'].clone().unsqueeze(0),
-            apex_target=targets['apex'].clone().unsqueeze(0),
-            apex_midpoint_target=targets['apex'].clone().unsqueeze(0),
+            apex_midpoint_target=targets['keypoints'][2].clone().unsqueeze(0),
             mesial_keypoint_x_labels=torch.from_numpy(
                 mesial_encoded['keypoint_x_labels']).float(),
             mesial_keypoint_y_labels=torch.from_numpy(
@@ -254,12 +231,12 @@ def _run_single_train_step(model, packed_inputs):
     return losses
 
 
-def test_base_anatomical_config_builds_and_runs():
+def test_base_anatomical_pointmask_config_builds_and_runs():
     register_all_modules()
     importlib.import_module('projects.panoramic_teeth_structured')
 
     config_path = ROOT / 'projects' / 'panoramic_teeth_structured' / 'configs' / (
-        'panoramic-teeth-anatomical_r50_8xb32-200e_v2-192x512.py')
+        'panoramic-teeth-anatomical-pointmask_r50_8xb32-200e_v2-192x512.py')
     cfg = Config.fromfile(str(config_path))
     cfg.model.test_cfg.flip_test = False
 
@@ -270,11 +247,13 @@ def test_base_anatomical_config_builds_and_runs():
     data = model.data_preprocessor(packed_inputs, training=True)
 
     losses = model.forward(**data, mode='loss')
+    assert 'loss_root_bce' in losses
     assert 'loss_kpt_mesial' in losses
     assert 'loss_kpt_apex' in losses
     assert 'loss_kpt_distal' in losses
     assert 'loss_side_attach' in losses
     assert 'loss_apex_consistency' in losses
+    assert 'loss_contour' not in losses
 
     model.eval()
     with torch.no_grad():
@@ -283,11 +262,12 @@ def test_base_anatomical_config_builds_and_runs():
     assert len(batch_results) == 2
     assert isinstance(batch_results[0], PoseDataSample)
     assert hasattr(batch_results[0].pred_instances, 'keypoints')
-    assert hasattr(batch_results[0].pred_instances, 'mesial_contour')
+    assert not hasattr(batch_results[0].pred_instances, 'mesial_contour')
     assert hasattr(batch_results[0].pred_fields, 'root_mask')
 
 
-def test_stage1_and_stage2_anatomical_dinov3_train_smoke(monkeypatch, tmp_path):
+def test_stage1_and_stage2_anatomical_pointmask_dinov3_train_smoke(
+        monkeypatch, tmp_path):
     _patch_transformers(monkeypatch)
     checkpoint_dir = _make_fake_checkpoint_dir(tmp_path)
 
@@ -296,10 +276,10 @@ def test_stage1_and_stage2_anatomical_dinov3_train_smoke(monkeypatch, tmp_path):
 
     config_dir = ROOT / 'projects' / 'panoramic_teeth_structured' / 'configs'
     stage1_config_path = config_dir / (
-        'panoramic-teeth-anatomical_dinov3-convnext-s_8xb32-200e_'
+        'panoramic-teeth-anatomical-pointmask_dinov3-convnext-s_8xb32-200e_'
         'v2-192x512_stage1.py')
     stage2_config_path = config_dir / (
-        'panoramic-teeth-anatomical_dinov3-convnext-s_8xb32-50e_'
+        'panoramic-teeth-anatomical-pointmask_dinov3-convnext-s_8xb32-50e_'
         'v2-192x512_stage2.py')
 
     from mmpose.models import build_pose_estimator
@@ -312,11 +292,11 @@ def test_stage1_and_stage2_anatomical_dinov3_train_smoke(monkeypatch, tmp_path):
     packed_inputs = _make_packed_inputs(batch_size=2)
     stage1_losses = _run_single_train_step(stage1_model, packed_inputs)
     assert 'loss_kpt_mesial' in stage1_losses
-    assert 'loss_contour' in stage1_losses
+    assert 'loss_root_bce' in stage1_losses
 
     stage1_dir = (
         tmp_path / 'work_dirs' /
-        'panoramic-teeth-anatomical_dinov3-convnext-s_8xb32-200e_v2-192x512_stage1'
+        'panoramic-teeth-anatomical-pointmask_dinov3-convnext-s_8xb32-200e_v2-192x512_stage1'
     )
     stage1_dir.mkdir(parents=True)
     stage1_ckpt = stage1_dir / 'best_NME_epoch_1.pth'
@@ -337,7 +317,7 @@ def test_stage1_and_stage2_anatomical_dinov3_train_smoke(monkeypatch, tmp_path):
     assert 'loss_apex_consistency' in stage2_losses
 
 
-def test_stage1_and_stage2_anatomical_dinov3_base_configs_build(
+def test_stage1_and_stage2_anatomical_pointmask_dinov3_base_configs_build(
         monkeypatch, tmp_path):
     _patch_transformers(monkeypatch, hidden_sizes=(128, 256, 512, 1024))
     checkpoint_dir = _make_fake_checkpoint_dir(tmp_path)
@@ -347,10 +327,10 @@ def test_stage1_and_stage2_anatomical_dinov3_base_configs_build(
 
     config_dir = ROOT / 'projects' / 'panoramic_teeth_structured' / 'configs'
     stage1_config_path = config_dir / (
-        'panoramic-teeth-anatomical_dinov3-convnext-b_8xb32-200e_'
+        'panoramic-teeth-anatomical-pointmask_dinov3-convnext-b_8xb32-200e_'
         'v2-192x512_stage1.py')
     stage2_config_path = config_dir / (
-        'panoramic-teeth-anatomical_dinov3-convnext-b_8xb32-50e_'
+        'panoramic-teeth-anatomical-pointmask_dinov3-convnext-b_8xb32-50e_'
         'v2-192x512_stage2.py')
 
     from mmpose.models import build_pose_estimator
@@ -362,7 +342,7 @@ def test_stage1_and_stage2_anatomical_dinov3_base_configs_build(
 
     stage1_dir = (
         tmp_path / 'work_dirs' /
-        'panoramic-teeth-anatomical_dinov3-convnext-b_8xb32-200e_v2-192x512_stage1'
+        'panoramic-teeth-anatomical-pointmask_dinov3-convnext-b_8xb32-200e_v2-192x512_stage1'
     )
     stage1_dir.mkdir(parents=True)
     torch.save({'state_dict': stage1_model.state_dict()},

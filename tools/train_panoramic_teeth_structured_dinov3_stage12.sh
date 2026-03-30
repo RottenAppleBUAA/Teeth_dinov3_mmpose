@@ -24,7 +24,7 @@ Usage:
   bash tools/train_panoramic_teeth_structured_dinov3_stage12.sh
 
 Optional environment variables:
-  PIPELINE=anatomical|anatomical-pointmask
+  PIPELINE=anatomical|anatomical-pointmask|anatomical-pointmask-sideprior
   BACKBONE=s|b
   STAGE1_EPOCHS=400
   STAGE1_BATCH_SIZE=64
@@ -38,6 +38,8 @@ Examples:
   PIPELINE=anatomical BACKBONE=b bash tools/train_panoramic_teeth_structured_dinov3_stage12.sh
   PIPELINE=anatomical-pointmask BACKBONE=b STAGE1_BATCH_SIZE=32 STAGE2_BATCH_SIZE=16 \
     bash tools/train_panoramic_teeth_structured_dinov3_stage12.sh
+  PIPELINE=anatomical-pointmask-sideprior BACKBONE=b \
+    bash tools/train_panoramic_teeth_structured_dinov3_stage12.sh
 EOF
 }
 
@@ -47,10 +49,10 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 case "${PIPELINE}" in
-  anatomical|anatomical-pointmask)
+  anatomical|anatomical-pointmask|anatomical-pointmask-sideprior)
     ;;
   *)
-    echo "Unsupported PIPELINE=${PIPELINE}. Expected anatomical or anatomical-pointmask." >&2
+    echo "Unsupported PIPELINE=${PIPELINE}. Expected anatomical, anatomical-pointmask or anatomical-pointmask-sideprior." >&2
     exit 1
     ;;
 esac

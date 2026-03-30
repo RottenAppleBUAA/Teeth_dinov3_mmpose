@@ -122,10 +122,41 @@ projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical-pointmask
 - `mesial/distal` 稠密监督由 `M_C -> M_B -> A` 和 `D_C -> D_B -> A` 两条伪线在线生成
 - 推理时不再单独预测 contour，显示用 side line 由点直接连接生成
 
+增强版 `point+mask + sideprior` 配置：
+
+```text
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical-pointmask-sideprior_r50_8xb32-200e_v2-192x512.py
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical-pointmask-sideprior_dinov3-convnext-s_8xb32-200e_v2-192x512_stage1.py
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical-pointmask-sideprior_dinov3-convnext-s_8xb32-50e_v2-192x512_stage2.py
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical-pointmask-sideprior_dinov3-convnext-b_8xb32-200e_v2-192x512_stage1.py
+projects/panoramic_teeth_structured/configs/panoramic-teeth-anatomical-pointmask-sideprior_dinov3-convnext-b_8xb32-50e_v2-192x512_stage2.py
+```
+
+这组 sideprior 配置采用：
+
+- 仍然以 `5` 个点和 `root mask` 作为推理输出
+- 不恢复显式 `mesial/distal boundary` 预测任务
+- 训练时重新引入真实 `side_contours` 生成的 dense anatomy distance supervision
+- 增加一个仅训练期使用的 coarse contour auxiliary branch，借鉴早期 structured baseline 的低自由度骨架先验
+- `flip_test=True`
+
 当前默认训练时长为：
 
 - Stage 1: `200` epochs
 - Stage 2: `50` epochs
+
+通用两阶段训练脚本：
+
+```text
+tools/train_panoramic_teeth_structured_dinov3_stage12.sh
+```
+
+支持：
+
+- `PIPELINE=anatomical`
+- `PIPELINE=anatomical-pointmask`
+- `PIPELINE=anatomical-pointmask-sideprior`
+- `BACKBONE=s|b`
 
 ## 评估
 

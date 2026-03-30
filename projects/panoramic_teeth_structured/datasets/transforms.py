@@ -466,9 +466,13 @@ class GenerateAnatomicalPointMaskTargets(BaseTransform):
     def __init__(self,
                  line_width: int = 2,
                  use_udp: bool = False,
+                 use_side_contour_prior: bool = False,
+                 num_contour_points: int = 16,
                  point_encoder: Optional[dict] = None) -> None:
         self.line_width = int(line_width)
         self.use_udp = bool(use_udp)
+        self.use_side_contour_prior = bool(use_side_contour_prior)
+        self.num_contour_points = int(num_contour_points)
         if point_encoder is None:
             point_encoder = dict(
                 type='SimCCLabel',
@@ -507,6 +511,30 @@ class GenerateAnatomicalPointMaskTargets(BaseTransform):
                 results.get('flip_direction', 'horizontal'))
         warp_mat = self._build_warp_mat(results)
         return transform_points(polygon, warp_mat)
+
+    def _transform_side_contours(self, results: Dict) -> tuple[np.ndarray, np.ndarray]:
+        side_contours = results.get('side_contours', {})
+        mesial_points = np.asarray(
+            side_contours.get('M', []), dtype=np.float32).reshape(-1, 2)
+        distal_points = np.asarray(
+            side_contours.get('D', []), dtype=np.float32).reshape(-1, 2)
+
+        if len(mesial_points) < 2 or len(distal_points) < 2:
+            return mesial_points, distal_points
+
+        if results.get('flip', False):
+            direction = results.get('flip_direction', 'horizontal')
+            mesial_points = flip_points(mesial_points, results['img_shape'],
+                                        direction)
+            distal_points = flip_points(distal_points, results['img_shape'],
+                                        direction)
+            if _should_swap_sides(direction):
+                mesial_points, distal_points = distal_points, mesial_points
+
+        warp_mat = self._build_warp_mat(results)
+        mesial_points = transform_points(mesial_points, warp_mat)
+        distal_points = transform_points(distal_points, warp_mat)
+        return mesial_points.astype(np.float32), distal_points.astype(np.float32)
 
     def _extract_keypoint_targets(self, results: Dict) -> np.ndarray:
         transformed_keypoints = np.asarray(
@@ -608,6 +636,70 @@ class GenerateAnatomicalPointMaskTargets(BaseTransform):
         distal_polyline_distance = distance_transform_from_binary(
             distal_polyline_map, normalize_by)
 
+        anatomy_fields = {}
+        contour_fields = {}
+        if self.use_side_contour_prior:
+            mesial_points, distal_points = self._transform_side_contours(results)
+            if len(mesial_points) < 2 or len(distal_points) < 2:
+                return None
+
+            mesial_contour = resample_semantic_side(mesial_points,
+                                                    self.num_contour_points)
+            distal_contour = resample_semantic_side(distal_points,
+                                                    self.num_contour_points)
+
+            mesial_boundary = rasterize_polyline(
+                mesial_points,
+                width=int(input_width),
+                height=int(input_height),
+                thickness=self.line_width)
+            distal_boundary = rasterize_polyline(
+                distal_points,
+                width=int(input_width),
+                height=int(input_height),
+                thickness=self.line_width)
+            mesial_distance = distance_transform_from_binary(
+                mesial_boundary, normalize_by)
+            distal_distance = distance_transform_from_binary(
+                distal_boundary, normalize_by)
+
+            mesial_tail = (
+                mesial_contour[2:] if len(mesial_contour) > 2 else
+                mesial_contour[-1:])
+            distal_tail = (
+                distal_contour[2:] if len(distal_contour) > 2 else
+                distal_contour[-1:])
+            mesial_anatomy = np.concatenate(
+                [keypoint_target[[0, 1]], mesial_tail], axis=0).astype(np.float32)
+            distal_anatomy = np.concatenate(
+                [keypoint_target[[4, 3]], distal_tail], axis=0).astype(np.float32)
+
+            mesial_anatomy_map = rasterize_polyline(
+                mesial_anatomy,
+                width=int(input_width),
+                height=int(input_height),
+                thickness=self.line_width)
+            distal_anatomy_map = rasterize_polyline(
+                distal_anatomy,
+                width=int(input_width),
+                height=int(input_height),
+                thickness=self.line_width)
+            mesial_anatomy_distance = distance_transform_from_binary(
+                mesial_anatomy_map, normalize_by)
+            distal_anatomy_distance = distance_transform_from_binary(
+                distal_anatomy_map, normalize_by)
+
+            anatomy_fields.update(
+                mesial_anatomy=mesial_anatomy_map[None, ...],
+                distal_anatomy=distal_anatomy_map[None, ...],
+                mesial_anatomy_distance=mesial_anatomy_distance[None, ...],
+                distal_anatomy_distance=distal_anatomy_distance[None, ...])
+            contour_fields.update(
+                mesial_distance=mesial_distance[None, ...],
+                distal_distance=distal_distance[None, ...],
+                mesial_contour=mesial_contour.astype(np.float32),
+                distal_contour=distal_contour.astype(np.float32))
+
         apex_midpoint_target = self._transform_apex_midpoint(results)
         if not np.isfinite(apex_midpoint_target).all():
             apex_midpoint_target = keypoint_target[2].copy()
@@ -627,6 +719,8 @@ class GenerateAnatomicalPointMaskTargets(BaseTransform):
         results['mesial_polyline_distance'] = mesial_polyline_distance[None, ...]
         results['distal_polyline_distance'] = distal_polyline_distance[None, ...]
         results['apex_midpoint_target'] = apex_midpoint_target.astype(np.float32)
+        results.update(anatomy_fields)
+        results.update(contour_fields)
 
         results['mesial_keypoint_x_labels'] = mesial_encoded['keypoint_x_labels']
         results['mesial_keypoint_y_labels'] = mesial_encoded['keypoint_y_labels']
@@ -642,6 +736,8 @@ class GenerateAnatomicalPointMaskTargets(BaseTransform):
     def __repr__(self) -> str:
         return (f'{self.__class__.__name__}('
                 f'line_width={self.line_width}, use_udp={self.use_udp}, '
+                f'use_side_contour_prior={self.use_side_contour_prior}, '
+                f'num_contour_points={self.num_contour_points}, '
                 f'point_encoder={self.point_encoder_cfg})')
 
 
@@ -746,7 +842,13 @@ class PackAnatomicalPointMaskInputs(PackPoseInputs):
             mesial_polyline_map='mesial_polyline_map',
             distal_polyline_map='distal_polyline_map',
             mesial_polyline_distance='mesial_polyline_distance',
-            distal_polyline_distance='distal_polyline_distance')
+            distal_polyline_distance='distal_polyline_distance',
+            mesial_anatomy='mesial_anatomy',
+            distal_anatomy='distal_anatomy',
+            mesial_anatomy_distance='mesial_anatomy_distance',
+            distal_anatomy_distance='distal_anatomy_distance',
+            mesial_distance='mesial_distance',
+            distal_distance='distal_distance')
         results['field_mapping_table'] = field_mapping
 
         label_mapping = dict(self.label_mapping_table)
@@ -754,6 +856,8 @@ class PackAnatomicalPointMaskInputs(PackPoseInputs):
         label_mapping.update(
             keypoint_target='keypoint_targets',
             apex_midpoint_target='apex_midpoint_target',
+            mesial_contour='mesial_contour',
+            distal_contour='distal_contour',
             mesial_keypoint_x_labels='mesial_keypoint_x_labels',
             mesial_keypoint_y_labels='mesial_keypoint_y_labels',
             mesial_keypoint_weights='mesial_keypoint_weights',
@@ -766,7 +870,8 @@ class PackAnatomicalPointMaskInputs(PackPoseInputs):
         results['label_mapping_table'] = label_mapping
 
         for key in ('keypoint_target', 'keypoint_weights',
-                    'apex_midpoint_target'):
+                    'apex_midpoint_target', 'mesial_contour',
+                    'distal_contour'):
             if key in results:
                 results[key] = np.expand_dims(
                     np.asarray(results[key], dtype=np.float32), axis=0)

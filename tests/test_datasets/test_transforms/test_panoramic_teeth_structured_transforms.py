@@ -235,3 +235,51 @@ def test_generate_anatomical_pointmask_targets_outputs_point_driven_fields():
     assert output['distal_keypoint_x_labels'].shape == (1, 2, 200)
     assert 'mesial_boundary' not in output
     assert 'mesial_contour' not in output
+
+
+def test_generate_anatomical_pointmask_targets_with_sideprior_outputs_dense_fields():
+    transform = GenerateAnatomicalPointMaskTargets(
+        line_width=2,
+        use_udp=False,
+        use_side_contour_prior=True,
+        num_contour_points=16,
+        point_encoder=dict(
+            type='SimCCLabel',
+            input_size=(100, 100),
+            sigma=(4.0, 4.0),
+            simcc_split_ratio=2.0,
+            normalize=False,
+            use_dark=False))
+
+    results = dict(
+        root_polygon=np.array([[25.0, 10.0], [20.0, 75.0], [40.0, 95.0],
+                               [60.0, 95.0], [80.0, 75.0], [75.0, 10.0]],
+                              dtype=np.float32),
+        side_contours=dict(
+            M=np.array([[25.0, 10.0], [22.0, 30.0], [24.0, 55.0], [40.0, 95.0]],
+                       dtype=np.float32),
+            D=np.array([[75.0, 10.0], [78.0, 30.0], [76.0, 55.0], [60.0, 95.0]],
+                       dtype=np.float32)),
+        apex_midpoint=np.array([50.0, 95.0], dtype=np.float32),
+        img_shape=(100, 100),
+        input_center=np.array([50.0, 50.0], dtype=np.float32),
+        input_scale=np.array([100.0, 100.0], dtype=np.float32),
+        input_size=(100, 100),
+        bbox_rotation=np.array([0.0], dtype=np.float32),
+        transformed_keypoints=np.array([[[25.0, 10.0], [22.0, 30.0],
+                                         [50.0, 95.0], [78.0, 30.0],
+                                         [75.0, 10.0]]],
+                                       dtype=np.float32),
+        keypoints_visible=np.ones((1, 5, 1), dtype=np.float32))
+
+    output = transform(results)
+
+    assert output is not None
+    assert output['mesial_anatomy'].shape == (1, 100, 100)
+    assert output['distal_anatomy'].shape == (1, 100, 100)
+    assert output['mesial_anatomy_distance'].shape == (1, 100, 100)
+    assert output['distal_anatomy_distance'].shape == (1, 100, 100)
+    assert output['mesial_distance'].shape == (1, 100, 100)
+    assert output['distal_distance'].shape == (1, 100, 100)
+    assert output['mesial_contour'].shape == (16, 2)
+    assert output['distal_contour'].shape == (16, 2)

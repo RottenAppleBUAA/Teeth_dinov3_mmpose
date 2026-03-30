@@ -124,7 +124,7 @@ def _make_fake_checkpoint_dir(tmp_path):
     return checkpoint_dir
 
 
-def _make_targets():
+def _make_targets(include_sideprior=False):
     height, width = 512, 192
     keypoints = torch.tensor(
         [[44.0, 96.0], [68.0, 168.0], [96.0, 440.0], [124.0, 168.0],
@@ -142,16 +142,44 @@ def _make_targets():
     mesial_polyline_distance = torch.zeros(1, height, width, dtype=torch.float32)
     distal_polyline_distance = torch.zeros(1, height, width, dtype=torch.float32)
 
-    return dict(
+    targets = dict(
         keypoints=keypoints,
         root_mask=root_mask,
         mesial_polyline_map=mesial_polyline_map,
         distal_polyline_map=distal_polyline_map,
         mesial_polyline_distance=mesial_polyline_distance,
         distal_polyline_distance=distal_polyline_distance)
+    if include_sideprior:
+        mesial_anatomy = mesial_polyline_map.clone()
+        distal_anatomy = distal_polyline_map.clone()
+        mesial_anatomy_distance = mesial_polyline_distance.clone()
+        distal_anatomy_distance = distal_polyline_distance.clone()
+        mesial_distance = mesial_polyline_distance.clone()
+        distal_distance = distal_polyline_distance.clone()
+        contour_steps = torch.linspace(0.0, 1.0, steps=16, dtype=torch.float32)
+        mesial_contour = torch.stack([
+            44.0 + (96.0 - 44.0) * contour_steps,
+            96.0 + (440.0 - 96.0) * contour_steps
+        ],
+                                     dim=-1)
+        distal_contour = torch.stack([
+            148.0 + (96.0 - 148.0) * contour_steps,
+            96.0 + (440.0 - 96.0) * contour_steps
+        ],
+                                     dim=-1)
+        targets.update(
+            mesial_anatomy=mesial_anatomy,
+            distal_anatomy=distal_anatomy,
+            mesial_anatomy_distance=mesial_anatomy_distance,
+            distal_anatomy_distance=distal_anatomy_distance,
+            mesial_distance=mesial_distance,
+            distal_distance=distal_distance,
+            mesial_contour=mesial_contour,
+            distal_contour=distal_contour)
+    return targets
 
 
-def _make_packed_inputs(batch_size=2):
+def _make_packed_inputs(batch_size=2, include_sideprior=False):
     packed_inputs = get_packed_inputs(
         batch_size=batch_size,
         num_instances=1,
@@ -161,7 +189,7 @@ def _make_packed_inputs(batch_size=2):
         with_heatmap=False,
         with_reg_label=False,
         with_simcc_label=False)
-    targets = _make_targets()
+    targets = _make_targets(include_sideprior=include_sideprior)
     codec = KEYPOINT_CODECS.build(
         dict(
             type='SimCCLabel',
@@ -182,13 +210,13 @@ def _make_packed_inputs(batch_size=2):
         keypoints_visible=torch.ones(1, 2).numpy())
 
     for data_sample in packed_inputs['data_samples']:
-        data_sample.gt_fields = PixelData(
+        field_kwargs = dict(
             root_mask=targets['root_mask'].clone(),
             mesial_polyline_map=targets['mesial_polyline_map'].clone(),
             distal_polyline_map=targets['distal_polyline_map'].clone(),
             mesial_polyline_distance=targets['mesial_polyline_distance'].clone(),
             distal_polyline_distance=targets['distal_polyline_distance'].clone())
-        data_sample.gt_instance_labels = InstanceData(
+        label_kwargs = dict(
             keypoint_targets=targets['keypoints'].clone().unsqueeze(0),
             keypoint_weights=torch.ones(1, 5, dtype=torch.float32),
             apex_midpoint_target=targets['keypoints'][2].clone().unsqueeze(0),
@@ -210,6 +238,19 @@ def _make_packed_inputs(batch_size=2):
                 distal_encoded['keypoint_y_labels']).float(),
             distal_keypoint_weights=torch.from_numpy(
                 distal_encoded['keypoint_weights']).float())
+        if include_sideprior:
+            field_kwargs.update(
+                mesial_anatomy=targets['mesial_anatomy'].clone(),
+                distal_anatomy=targets['distal_anatomy'].clone(),
+                mesial_anatomy_distance=targets['mesial_anatomy_distance'].clone(),
+                distal_anatomy_distance=targets['distal_anatomy_distance'].clone(),
+                mesial_distance=targets['mesial_distance'].clone(),
+                distal_distance=targets['distal_distance'].clone())
+            label_kwargs.update(
+                mesial_contour=targets['mesial_contour'].clone().unsqueeze(0),
+                distal_contour=targets['distal_contour'].clone().unsqueeze(0))
+        data_sample.gt_fields = PixelData(**field_kwargs)
+        data_sample.gt_instance_labels = InstanceData(**label_kwargs)
         data_sample.set_metainfo(
             dict(
                 flip_indices=[4, 3, 2, 1, 0],
@@ -263,6 +304,38 @@ def test_base_anatomical_pointmask_config_builds_and_runs():
     assert isinstance(batch_results[0], PoseDataSample)
     assert hasattr(batch_results[0].pred_instances, 'keypoints')
     assert not hasattr(batch_results[0].pred_instances, 'mesial_contour')
+    assert hasattr(batch_results[0].pred_fields, 'root_mask')
+
+
+def test_sideprior_anatomical_pointmask_config_builds_and_runs():
+    register_all_modules()
+    importlib.import_module('projects.panoramic_teeth_structured')
+
+    config_path = ROOT / 'projects' / 'panoramic_teeth_structured' / 'configs' / (
+        'panoramic-teeth-anatomical-pointmask-sideprior_r50_8xb32-200e_v2-192x512.py'
+    )
+    cfg = Config.fromfile(str(config_path))
+    cfg.model.test_cfg.flip_test = False
+
+    from mmpose.models import build_pose_estimator
+
+    model = build_pose_estimator(cfg.model)
+    packed_inputs = _make_packed_inputs(batch_size=2, include_sideprior=True)
+    data = model.data_preprocessor(packed_inputs, training=True)
+
+    losses = model.forward(**data, mode='loss')
+    assert 'loss_contour_aux' in losses
+    assert 'loss_contour_attach_aux' in losses
+    assert 'loss_side_attach' in losses
+    assert 'loss_kpt_apex' in losses
+
+    model.eval()
+    with torch.no_grad():
+        batch_results = model.forward(**data, mode='predict')
+
+    assert len(batch_results) == 2
+    assert isinstance(batch_results[0], PoseDataSample)
+    assert hasattr(batch_results[0].pred_instances, 'keypoints')
     assert hasattr(batch_results[0].pred_fields, 'root_mask')
 
 
@@ -343,6 +416,42 @@ def test_stage1_and_stage2_anatomical_pointmask_dinov3_base_configs_build(
     stage1_dir = (
         tmp_path / 'work_dirs' /
         'panoramic-teeth-anatomical-pointmask_dinov3-convnext-b_8xb32-200e_v2-192x512_stage1'
+    )
+    stage1_dir.mkdir(parents=True)
+    torch.save({'state_dict': stage1_model.state_dict()},
+               stage1_dir / 'best_NME_epoch_1.pth')
+
+    monkeypatch.chdir(tmp_path)
+    stage2_cfg = Config.fromfile(str(stage2_config_path))
+    assert stage2_cfg.load_from is not None
+
+
+def test_stage1_and_stage2_anatomical_pointmask_sideprior_dinov3_base_configs_build(
+        monkeypatch, tmp_path):
+    _patch_transformers(monkeypatch, hidden_sizes=(128, 256, 512, 1024))
+    checkpoint_dir = _make_fake_checkpoint_dir(tmp_path)
+
+    register_all_modules()
+    importlib.import_module('projects.panoramic_teeth_structured')
+
+    config_dir = ROOT / 'projects' / 'panoramic_teeth_structured' / 'configs'
+    stage1_config_path = config_dir / (
+        'panoramic-teeth-anatomical-pointmask-sideprior_dinov3-convnext-b_8xb32-200e_'
+        'v2-192x512_stage1.py')
+    stage2_config_path = config_dir / (
+        'panoramic-teeth-anatomical-pointmask-sideprior_dinov3-convnext-b_8xb32-50e_'
+        'v2-192x512_stage2.py')
+
+    from mmpose.models import build_pose_estimator
+
+    stage1_cfg = Config.fromfile(str(stage1_config_path))
+    stage1_cfg.model.backbone.pretrained = str(checkpoint_dir)
+    stage1_model = build_pose_estimator(stage1_cfg.model)
+    assert stage1_model.backbone.out_channels == (1024, )
+
+    stage1_dir = (
+        tmp_path / 'work_dirs' /
+        'panoramic-teeth-anatomical-pointmask-sideprior_dinov3-convnext-b_8xb32-200e_v2-192x512_stage1'
     )
     stage1_dir.mkdir(parents=True)
     torch.save({'state_dict': stage1_model.state_dict()},

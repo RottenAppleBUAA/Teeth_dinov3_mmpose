@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Sequence, Tuple, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -32,19 +32,30 @@ def _stack_label(batch_data_samples: OptSampleList, label_name: str) -> Tensor:
 
 @MODELS.register_module()
 class AnatomicalPointMaskHead(BaseHead):
-    """Predict anatomical points with root-mask auxiliary supervision."""
+    """Predict anatomical points with root-mask auxiliary supervision.
+
+    The default mode keeps the existing point+mask behavior. When
+    ``side_prior_mode='anatomy'`` and contour auxiliary weights are enabled,
+    the head borrows the old structured baseline's dense side-contour prior
+    without exposing extra outputs at inference time.
+    """
 
     def __init__(self,
                  in_channels: Union[int, Sequence[int]],
                  input_size: Tuple[int, int],
                  feat_channels: int = 256,
                  num_convs: int = 2,
+                 contour_points: int = 16,
+                 contour_hidden_dim: int = 512,
                  point_head_cfg: OptConfigType = None,
                  root_bce_weight: float = 1.0,
                  root_dice_weight: float = 1.0,
                  mesial_point_weight: float = 1.0,
                  apex_point_weight: float = 1.0,
                  distal_point_weight: float = 1.0,
+                 side_prior_mode: str = 'polyline',
+                 contour_aux_weight: float = 0.0,
+                 contour_attach_aux_weight: float = 0.0,
                  side_attach_weight: float = 0.5,
                  side_repel_weight: float = 0.2,
                  point_gap_weight: float = 0.2,
@@ -60,12 +71,21 @@ class AnatomicalPointMaskHead(BaseHead):
             raise ValueError(
                 f'{self.__class__.__name__} does not support multiple inputs.')
 
+        if side_prior_mode not in {'polyline', 'anatomy'}:
+            raise ValueError(
+                f'Unsupported side_prior_mode={side_prior_mode!r}.')
+
         self.input_size = tuple(int(v) for v in input_size)
+        self.contour_points = int(contour_points)
+        self.side_prior_mode = side_prior_mode
+
         self.root_bce_weight = float(root_bce_weight)
         self.root_dice_weight = float(root_dice_weight)
         self.mesial_point_weight = float(mesial_point_weight)
         self.apex_point_weight = float(apex_point_weight)
         self.distal_point_weight = float(distal_point_weight)
+        self.contour_aux_weight = float(contour_aux_weight)
+        self.contour_attach_aux_weight = float(contour_attach_aux_weight)
         self.side_attach_weight = float(side_attach_weight)
         self.side_repel_weight = float(side_repel_weight)
         self.point_gap_weight = float(point_gap_weight)
@@ -86,6 +106,16 @@ class AnatomicalPointMaskHead(BaseHead):
             current_channels = feat_channels
         self.decoder = nn.Sequential(*layers)
         self.root_classifier = nn.Conv2d(current_channels, 1, kernel_size=1)
+
+        self.enable_contour_aux = (
+            self.contour_aux_weight > 0 or self.contour_attach_aux_weight > 0)
+        if self.enable_contour_aux:
+            self.contour_mlp = nn.Sequential(
+                nn.Linear(current_channels * 2, contour_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(contour_hidden_dim, 2 * self.contour_points * 2))
+        else:
+            self.contour_mlp = None
 
         if point_head_cfg is None:
             raise ValueError('`point_head_cfg` is required.')
@@ -108,16 +138,34 @@ class AnatomicalPointMaskHead(BaseHead):
 
         self.simcc_split_ratio = float(self.apex_head.simcc_split_ratio)
 
-    def _root_forward(self, feats: Tuple[Tensor]) -> Tensor:
-        x = feats[-1]
-        x = self.decoder(x)
-        root_logits = self.root_classifier(x)
+    def _decode_features(self, feats: Tuple[Tensor]) -> Tensor:
+        return self.decoder(feats[-1])
+
+    def _root_logits_from_decoded(self, decoded: Tensor) -> Tensor:
+        root_logits = self.root_classifier(decoded)
         output_size = (int(self.input_size[1]), int(self.input_size[0]))
         return F.interpolate(
             root_logits,
             size=output_size,
             mode='bilinear',
             align_corners=False)
+
+    def _root_forward(self, feats: Tuple[Tensor]) -> Tensor:
+        return self._root_logits_from_decoded(self._decode_features(feats))
+
+    def _contour_forward_from_decoded(self, decoded: Tensor) -> Optional[Tensor]:
+        if not self.enable_contour_aux:
+            return None
+
+        avg = F.adaptive_avg_pool2d(decoded, 1).flatten(1)
+        max_pool = F.adaptive_max_pool2d(decoded, 1).flatten(1)
+        contour = self.contour_mlp(torch.cat([avg, max_pool], dim=1))
+        contour = contour.view(-1, 2, self.contour_points, 2).sigmoid()
+
+        width = max(self.input_size[0] - 1, 1)
+        height = max(self.input_size[1] - 1, 1)
+        return torch.cat(
+            [contour[..., 0:1] * width, contour[..., 1:2] * height], dim=-1)
 
     def _point_forward(self, feats: Tuple[Tensor]) -> Dict[str, Tuple[Tensor, Tensor]]:
         return dict(
@@ -197,22 +245,34 @@ class AnatomicalPointMaskHead(BaseHead):
         return root_logits, point_logits
 
     def forward(self, feats: Tuple[Tensor]):
-        root_logits = self._root_forward(feats)
+        decoded = self._decode_features(feats)
+        root_logits = self._root_logits_from_decoded(decoded)
         point_logits = self._point_forward(feats)
-        return root_logits, point_logits
+        contour_preds = self._contour_forward_from_decoded(decoded)
+        return root_logits, point_logits, contour_preds
 
     def loss(self,
              feats: Tuple[Tensor],
              batch_data_samples: OptSampleList,
              train_cfg: ConfigType = {}) -> dict:
         del train_cfg
-        root_logits, point_logits = self.forward(feats)
+        root_logits, point_logits, contour_preds = self.forward(feats)
 
         gt_root = _stack_field(batch_data_samples, 'root_mask').to(root_logits.device)
-        gt_mesial_dt = _stack_field(
-            batch_data_samples, 'mesial_polyline_distance').to(root_logits.device)
-        gt_distal_dt = _stack_field(
-            batch_data_samples, 'distal_polyline_distance').to(root_logits.device)
+        if self.side_prior_mode == 'anatomy':
+            gt_mesial_dt = _stack_field(
+                batch_data_samples, 'mesial_anatomy_distance').to(
+                    root_logits.device)
+            gt_distal_dt = _stack_field(
+                batch_data_samples, 'distal_anatomy_distance').to(
+                    root_logits.device)
+        else:
+            gt_mesial_dt = _stack_field(
+                batch_data_samples, 'mesial_polyline_distance').to(
+                    root_logits.device)
+            gt_distal_dt = _stack_field(
+                batch_data_samples, 'distal_polyline_distance').to(
+                    root_logits.device)
         gt_apex_midpoint = _stack_label(
             batch_data_samples, 'apex_midpoint_target').to(root_logits.device)
 
@@ -251,6 +311,41 @@ class AnatomicalPointMaskHead(BaseHead):
         height = max(self.input_size[1] - 1, 1)
         keypoints_norm = keypoints / keypoints.new_tensor(
             [width, height]).view(1, 1, 2)
+
+        losses = {
+            'loss_root_bce':
+            F.binary_cross_entropy_with_logits(root_logits, gt_root) *
+            self.root_bce_weight,
+            'loss_root_dice':
+            self._dice_loss(root_logits, gt_root) * self.root_dice_weight,
+            'loss_kpt_mesial':
+            mesial_point_loss * self.mesial_point_weight,
+            'loss_kpt_apex':
+            apex_point_loss * self.apex_point_weight,
+            'loss_kpt_distal':
+            distal_point_loss * self.distal_point_weight,
+        }
+
+        if self.enable_contour_aux and contour_preds is not None:
+            gt_mesial_contour = _stack_label(batch_data_samples,
+                                             'mesial_contour').to(contour_preds.device)
+            gt_distal_contour = _stack_label(batch_data_samples,
+                                             'distal_contour').to(contour_preds.device)
+            gt_mesial_side_dt = _stack_field(batch_data_samples, 'mesial_distance').to(
+                contour_preds.device)
+            gt_distal_side_dt = _stack_field(batch_data_samples, 'distal_distance').to(
+                contour_preds.device)
+
+            norm = contour_preds.new_tensor([width, height]).view(1, 1, 1, 2)
+            gt_contours = torch.stack([gt_mesial_contour, gt_distal_contour], dim=1)
+            contour_loss = F.smooth_l1_loss(contour_preds / norm, gt_contours / norm)
+            contour_attach = 0.5 * (
+                self._sample_maps(gt_mesial_side_dt, contour_preds[:, 0]).mean() +
+                self._sample_maps(gt_distal_side_dt, contour_preds[:, 1]).mean())
+            losses.update(
+                loss_contour_aux=contour_loss * self.contour_aux_weight,
+                loss_contour_attach_aux=contour_attach *
+                self.contour_attach_aux_weight)
 
         mesial_attach = self._sample_maps(
             gt_mesial_dt, keypoints[:, [0, 1, 2]]).mean()
@@ -292,29 +387,14 @@ class AnatomicalPointMaskHead(BaseHead):
         apex_consistency = F.smooth_l1_loss(pred_apex_norm,
                                             gt_apex_midpoint_norm)
 
-        return {
-            'loss_root_bce':
-            F.binary_cross_entropy_with_logits(root_logits, gt_root) *
-            self.root_bce_weight,
-            'loss_root_dice':
-            self._dice_loss(root_logits, gt_root) * self.root_dice_weight,
-            'loss_kpt_mesial':
-            mesial_point_loss * self.mesial_point_weight,
-            'loss_kpt_apex':
-            apex_point_loss * self.apex_point_weight,
-            'loss_kpt_distal':
-            distal_point_loss * self.distal_point_weight,
-            'loss_side_attach':
-            side_attach * self.side_attach_weight,
-            'loss_side_repel':
-            side_repel * self.side_repel_weight,
-            'loss_point_gap':
-            point_gap * self.point_gap_weight,
-            'loss_vertical_order':
-            vertical_order * self.vertical_order_weight,
-            'loss_apex_consistency':
-            apex_consistency * self.apex_consistency_weight,
-        }
+        losses.update(
+            loss_side_attach=side_attach * self.side_attach_weight,
+            loss_side_repel=side_repel * self.side_repel_weight,
+            loss_point_gap=point_gap * self.point_gap_weight,
+            loss_vertical_order=vertical_order * self.vertical_order_weight,
+            loss_apex_consistency=apex_consistency *
+            self.apex_consistency_weight)
+        return losses
 
     def predict(self,
                 feats,
@@ -324,7 +404,7 @@ class AnatomicalPointMaskHead(BaseHead):
             root_logits, point_logits = self._merge_tta_logits(
                 feats, batch_data_samples)
         else:
-            root_logits, point_logits = self.forward(feats)
+            root_logits, point_logits, _ = self.forward(feats)
 
         mesial_preds, apex_preds, distal_preds = self._decode_points(point_logits)
         root_probs = root_logits.sigmoid()

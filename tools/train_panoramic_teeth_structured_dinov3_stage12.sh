@@ -65,8 +65,8 @@ case "${BACKBONE}" in
 esac
 
 CONFIG_PREFIX="panoramic-teeth-${PIPELINE}_dinov3-convnext-${BACKBONE}_8xb32"
-STAGE1_CONFIG="projects/panoramic_teeth_structured/configs/${CONFIG_PREFIX}_200e_v2-192x512_stage1.py"
-STAGE2_CONFIG="projects/panoramic_teeth_structured/configs/${CONFIG_PREFIX}_50e_v2-192x512_stage2.py"
+STAGE1_CONFIG="projects/panoramic_teeth_structured/configs/${CONFIG_PREFIX}-200e_v2-192x512_stage1.py"
+STAGE2_CONFIG="projects/panoramic_teeth_structured/configs/${CONFIG_PREFIX}-50e_v2-192x512_stage2.py"
 
 if [[ ! -f "${REPO_ROOT}/${STAGE1_CONFIG}" ]]; then
   echo "Stage1 config not found: ${STAGE1_CONFIG}" >&2
